@@ -21,7 +21,7 @@ TZ = ZoneInfo("Asia/Tokyo")
 MAIN_CHART_HEIGHT = 600  # メイン/先物/日経 すべて統一
 
 # =========================================================
-# ユーティリティ（元コード互換）
+# ユーティリティ
 # =========================================================
 def _clean_colname(name: str) -> str:
     if name is None: return ""
@@ -33,16 +33,21 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns={c:_clean_colname(c) for c in df.columns})
 
 def to_numeric_jp(x):
+    """日本語CSVでよくある表記を数値化。 (123)→-123, 全角マイナス, 桁区切り, 円/株/％など除去"""
     if isinstance(x, pd.Series):
         s = (x.astype(str)
+               .str.replace(r"\((\s*[\d,\.]+)\)", r"-\1", regex=True)  # (123)→-123
+               .str.replace("−", "-", regex=False)                     # 全角マイナス
                .str.replace(",", "", regex=False)
                .str.replace("円", "", regex=False)
                .str.replace("株", "", regex=False)
+               .str.replace("%", "", regex=False)
                .str.strip())
         return pd.to_numeric(s, errors="coerce")
     if pd.isna(x): return np.nan
     if isinstance(x, str):
-        x = x.replace(",", "").replace("円", "").replace("株", "").strip()
+        x = re.sub(r"\((\s*[\d,\.]+)\)", r"-\1", x)
+        x = x.replace("−","-").replace(",","").replace("円","").replace("株","").replace("%","").strip()
     return pd.to_numeric(x, errors="coerce")
 
 # ---- アップロード用の堅牢リーダー（CSV/TXT/XLSX）
@@ -57,7 +62,6 @@ def read_table_from_upload(file_name: str, file_bytes: bytes) -> pd.DataFrame:
 
     # テキスト（CSV/TSV/その他区切り）
     text = None
-    # まずは候補エンコーディングで順に try
     for enc in ["utf-8-sig","utf-8","cp932","shift_jis","euc_jp"]:
         try:
             text = file_bytes.decode(enc)
@@ -82,7 +86,6 @@ def read_table_from_upload(file_name: str, file_bytes: bytes) -> pd.DataFrame:
         return clean_columns(df)
     except Exception:
         try:
-            # セパレーター指定なしで最終トライ
             df = pd.read_csv(StringIO(text), engine="python")
             return clean_columns(df)
         except Exception:
@@ -111,7 +114,7 @@ def concat_uploaded_tables(files, sig: str, add_source_col: bool=True) -> pd.Dat
     return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
 # =========================================================
-# 銘柄コード/名称 正規化（元コード互換）
+# 銘柄コード/名称 正規化
 # =========================================================
 def normalize_symbol_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return df
@@ -167,15 +170,46 @@ def build_code_to_name_map(*dfs: pd.DataFrame) -> dict:
     return mp
 
 # =========================================================
-# 実現損益・約定の正規化（元コード互換）
+# 実現損益・約定の正規化
 # =========================================================
 def normalize_realized(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return df
-    d = df.copy()
-    if "約定日" in d.columns:
-        d["約定日"] = pd.to_datetime(d["約定日"], errors="coerce")
-    if "実現損益[円]" in d.columns:
-        d["実現損益[円"] = to_numeric_jp(d["実現損益[円]"])
+    """列名ゆる検出＋数値化の決定版。'約定日' と '実現損益[円]' を作る。"""
+    if df is None or df.empty:
+        return df
+    d = clean_columns(df.copy())
+
+    # 約定日を検出
+    date_col = None
+    for c in ["約定日","約定日時","日付","日時"]:
+        if c in d.columns:
+            date_col = c; break
+    if date_col is None:
+        for c in d.columns:
+            if re.search(r"(約定)?.*(日|日時)", str(c)):
+                date_col = c; break
+    if date_col:
+        d["約定日"] = pd.to_datetime(d[date_col], errors="coerce")
+
+    # 実現損益列を検出 → "実現損益[円]" に正規化
+    pl_col = None
+    for c in ["実現損益[円]","実現損益（円）","実現損益","損益[円]","損益額","損益"]:
+        if c in d.columns:
+            pl_col = c; break
+    if pl_col is None:
+        candidates = [c for c in d.columns
+                      if any(t in str(c).lower() for t in ["損益","pnl","profit","realized","pl"])]
+        best, best_ratio = None, 0.0
+        for c in candidates:
+            s = to_numeric_jp(d[c])
+            ratio = s.notna().mean()
+            if ratio > best_ratio:
+                best_ratio, best = ratio, c
+        pl_col = best
+    if pl_col:
+        d["実現損益[円]"] = to_numeric_jp(d[pl_col])
+    else:
+        d["実現損益[円]"] = pd.Series(dtype="float64")
+
     return normalize_symbol_cols(d)
 
 def normalize_yakujyou(df: pd.DataFrame) -> pd.DataFrame:
@@ -194,7 +228,7 @@ def lr_from_realized_trade(val: str) -> str | None:
     if "buy" in sl and "close" in sl:  return "SHORT"
     return None
 
-# ---- 約定 → IN/OUT マーカー生成（元コード互換）
+# ---- 約定 → IN/OUT マーカー生成
 def pick_dt_col(df: pd.DataFrame, preferred=None) -> str | None:
     if df is None or df.empty: return None
     cands = preferred or ["約定日","約定日時","約定日付","日時"]
@@ -430,8 +464,8 @@ def load_ohlc_map_from_uploads(files, sig: str):
             "time": ["time", "日時"],
             "open": ["open", "始値"],
             "high": ["high", "高値"],
-            "low": ["low", "安値"],
-            "close": ["close", "終値"],
+            "low":  ["low",  "安値"],
+            "close":["close","終値"],
         }
         original_cols = {c.lower(): c for c in df.columns}
         for std, cands in CANDIDATES.items():
@@ -580,11 +614,17 @@ def download_button_df(df, label, filename):
     st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
 
 def compute_max_drawdown(series: pd.Series) -> float:
-    if series is None or series.empty: return np.nan
-    arr = series.to_numpy(dtype=float)
+    """非数値/NAが混ざっても安全に最大ドローダウンを返す"""
+    if series is None:
+        return np.nan
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return np.nan
+    arr = s.to_numpy(dtype=float)
     peak, max_dd = -np.inf, 0.0
     for x in arr:
-        peak = max(peak, x); max_dd = max(max_dd, peak - x)
+        peak = max(peak, x)
+        max_dd = max(max_dd, peak - x)
     return float(max_dd)
 
 def find_first_key_by_prefix(ohlc_map: dict, prefix: str, sel_date: date | None = None) -> str | None:
@@ -652,7 +692,7 @@ def apply_trade_type_filter(df: pd.DataFrame) -> pd.DataFrame:
     if "スイング" in trade_type: return df[df["信用区分"]=="制度"]
     return df
 
-# 期間フィルタ（KPIや集計用）
+# 期間フィルタ
 st.subheader("期間フィルタ")
 c1,c2,c3 = st.columns([2,2,3])
 with c1:
@@ -687,6 +727,10 @@ realized_f = apply_trade_type_filter(filter_by_span(realized, "約定日"))
 # KPI
 # =========================================================
 st.subheader("KPI")
+
+# 念のため数値化（normalize_realized でも行うが二重で安全）
+if not realized_f.empty and "実現損益[円]" in realized_f.columns:
+    realized_f["実現損益[円]"] = to_numeric_jp(realized_f["実現損益[円]"])
 
 pl = None
 if not realized_f.empty and "実現損益[円]" in realized_f.columns:
@@ -727,8 +771,9 @@ with c7:
     if not realized_f.empty and "約定日" in realized_f.columns and "実現損益[円]" in realized_f.columns:
         tmp = realized_f.copy()
         tmp["日"] = pd.to_datetime(tmp["約定日"], errors="coerce").dt.date
+        tmp["実現損益[円]"] = to_numeric_jp(tmp["実現損益[円]"])  # ★数値化
         seq = tmp.groupby("日", as_index=False)["実現損益[円]"].sum().sort_values("日")
-        seq["累計"] = seq["実現損益[円]"].cumsum()
+        seq["累計"] = pd.to_numeric(seq["実現損益[円]"], errors="coerce").cumsum()
         dd = compute_max_drawdown(seq["累計"])
         st.metric("最大ドローダウン", f"{int(round(dd)):,} 円" if pd.notna(dd) else "—")
     else:
@@ -747,6 +792,7 @@ with tab1:
     else:
         r = realized_f.copy()
         dts = pd.to_datetime(r["約定日"], errors="coerce")
+        r["実現損益[円]"] = to_numeric_jp(r["実現損益[円]"])  # ★数値化
         r["日"] = dts.dt.date
         r["週"] = (dts - pd.to_timedelta(dts.dt.weekday, unit="D")).dt.date
         r["月"] = dts.dt.to_period("M").dt.to_timestamp().dt.date
@@ -768,8 +814,9 @@ with tab2:
     else:
         d = realized_f.copy()
         d["日"] = pd.to_datetime(d["約定日"]).dt.date
+        d["実現損益[円]"] = to_numeric_jp(d["実現損益[円]"])  # ★数値化
         seq = d.groupby("日", as_index=False)["実現損益[円]"].sum().sort_values("日")
-        seq["累計"] = seq["実現損益[円]"].cumsum()
+        seq["累計"] = pd.to_numeric(seq["実現損益[円]"], errors="coerce").cumsum()
         seq_disp = seq.copy()
         seq_disp["実現損益[円]"] = seq_disp["実現損益[円]"].round(0).astype("Int64")
         seq_disp["累計"] = seq_disp["累計"].round(0).astype("Int64")
@@ -790,6 +837,7 @@ def per_symbol_stats(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["銘柄コード","銘柄名","実現損益合計","取引回数","1回平均損益","勝率"])
     d = normalize_symbol_cols(df.copy())
+    # 数値化を保証
     if "実現損益[円]" in d.columns: d["実現損益"] = to_numeric_jp(d["実現損益[円]"])
     else:
         cand = next((c for c in d.columns if ("実現" in str(c) and "損益" in str(c))), None)
@@ -830,7 +878,7 @@ with tab4:
         st.info("実現損益データが必要です。")
     else:
         d = normalize_symbol_cols(realized_f.copy())
-        d["実現損益"] = d["実現損益[円]"]
+        d["実現損益"] = to_numeric_jp(d["実現損益[円]"]) if "実現損益[円]" in d.columns else np.nan
         d["group_key"] = np.where(d["code_key"].notna()&(d["code_key"]!=""), d["code_key"], "NAMEONLY::"+d["name_key"].astype(str))
         by_symbol = d.groupby("group_key").agg({"実現損益":["count","sum","mean"]})
         by_symbol.columns = ["取引回数","実現損益合計","1回平均損益"]
