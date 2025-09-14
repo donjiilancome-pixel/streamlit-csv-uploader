@@ -1,6 +1,12 @@
 import io
 import pandas as pd
 import streamlit as st
+import csv
+try:
+    from charset_normalizer import from_bytes as cn_from_bytes
+except Exception:
+    cn_from_bytes = None
+
 
 st.set_page_config(page_title="CSV Viewer (Upload)", layout="wide")
 
@@ -11,11 +17,15 @@ st.caption("①CSVをアップロード → ②文字コードなどを選ぶ �
 with st.sidebar:
     st.header("読み込み設定")
     encoding = st.selectbox(
-        "文字コード（文字化け対策）",
-        options=["utf-8", "utf-8-sig", "cp932 (Shift_JIS)"],
-        index=0,
-        help="日本のCSVで文字化けする場合は Shift_JIS (=cp932) を試してください。",
-    )
+    "文字コード",
+    options=[
+        "auto (自動判別)", "utf-8", "utf-8-sig",
+        "cp932 (Shift_JIS)", "utf-16", "utf-16-le", "utf-16-be",
+        "euc_jp", "iso2022_jp"
+    ],
+    index=0,
+)
+
     decimal = st.selectbox("小数点記号", options=[".", ","], index=0)
     thousands = st.selectbox("桁区切り", options=[None, ",", "_", " "], index=0)
     preview_rows = st.slider("プレビュー行数", min_value=5, max_value=200, value=50, step=5)
@@ -29,17 +39,58 @@ st.write("## 1) CSVファイルをアップロード")
 uploaded = st.file_uploader("CSVを1つ選択", type=["csv"])
 
 @st.cache_data(show_spinner=True)
-def load_dataframe(file_bytes: bytes, encoding: str, decimal: str, thousands):
-    # pandasに渡す引数を準備
-    read_kwargs = {
-        "encoding": encoding if "cp932" not in encoding else "cp932",
-        "decimal": decimal,
-        "thousands": thousands if thousands not in (None, "None", "") else None,
-        "engine": "python",   # 区切り文字の自動推定を許可（柔軟）
-    }
-    with io.BytesIO(file_bytes) as f:
-        df = pd.read_csv(f, **read_kwargs)
-    return df
+def load_dataframe(file_bytes: bytes, encoding_choice: str, decimal: str, thousands):
+    # 候補を作る
+    candidates = []
+    if encoding_choice.startswith("auto"):
+        b = file_bytes
+        # BOMヒューリスティクス
+        if b.startswith(b"\xff\xfe") or b.startswith(b"\xfe\xff"):
+            candidates.append("utf-16")
+        elif b.startswith(b"\xef\xbb\xbf"):
+            candidates.append("utf-8-sig")
+        # ライブラリで推定
+        if cn_from_bytes is not None:
+            try:
+                best = cn_from_bytes(b).best()
+                if best and best.encoding:
+                    candidates.insert(0, best.encoding)
+            except Exception:
+                pass
+        candidates += ["utf-8", "cp932", "utf-16", "utf-16-le", "utf-16-be", "euc_jp", "iso2022_jp"]
+    else:
+        candidates = ["cp932" if "cp932" in encoding_choice else encoding_choice]
+
+    last_err = None
+    for enc in dict.fromkeys(candidates):  # 重複除去
+        try:
+            text = file_bytes.decode(enc)
+            # 区切り文字を推定（CSV/TSV/; / |）
+            sample = text[:20000]
+            sep = None
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=[",", "\t", ";", "|"])
+                sep = dialect.delimiter
+            except Exception:
+                if sample.count("\t") > sample.count(","):
+                    sep = "\t"
+            import io as _io
+            df = pd.read_csv(
+                _io.StringIO(text),
+                sep=sep,
+                decimal=decimal,
+                thousands=None if thousands in (None, "None", "") else thousands,
+                engine="python",
+            )
+            # 使った情報を添付（表示に使える）
+            df.attrs["used_encoding"] = enc
+            df.attrs["used_sep"] = sep or ","
+            return df
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
+
 
 def coerce_datetime(df: pd.DataFrame, candidates: list[str]) -> pd.DataFrame:
     """候補名のいずれかが存在すれば、時刻としてパースしてインデックスに設定"""
