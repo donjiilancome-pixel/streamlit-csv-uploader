@@ -285,4 +285,103 @@ with tab2:
     # 列候補
     t_time_c = st.text_input("（約定）時刻 列候補", value="約定時間,日時,日付,time,Time")
     t_side_c = st.text_input("売買 列候補", value="売買,side,Side,区分,取引")
-    t_qty_c  = st.text_input("数量（約定数） 列候補", value="約定数,数量,株数,約定数量,Qty,qty,サ_
+    t_qty_c  = st.text_input("数量（約定数） 列候補", value="約定数,数量,株数,約定数量,Qty,qty,サイズ")
+    t_price_c= st.text_input("価格（約定単価） 列候補", value="約定単価,単価,価格,Price,price")
+
+    if trades_file is None:
+        st.info("📄 ファイルを選ぶとタブ①に“買/売マーカー”を重ねられます。")
+    else:
+        try:
+            df_tr = load_any_table(trades_file.name, trades_file.getvalue(), encoding, decimal, thousands)
+        except Exception as e:
+            st.error("読み込みに失敗しました。")
+            st.exception(e)
+            st.stop()
+
+        used_enc = df_tr.attrs.get("used_encoding")
+        used_sep = df_tr.attrs.get("used_sep")
+        if used_enc or used_sep:
+            st.caption(f"🔎 encoding={used_enc or 'Excel'}, sep={used_sep or '(Excel)'}")
+
+        # 列検出
+        def pick(col_cands): return _find_first(df_tr, _split_candidates(col_cands))
+        t_time = pick(t_time_c); t_side = pick(t_side_c); t_qty = pick(t_qty_c); t_price = pick(t_price_c)
+
+        # 型変換
+        if t_time:
+            df_tr[t_time] = pd.to_datetime(df_tr[t_time], errors="coerce")
+        for col in [t_qty, t_price]:
+            if col and col in df_tr.columns:
+                df_tr[col] = pd.to_numeric(df_tr[col], errors="coerce")
+
+        # 売買正規化
+        if t_side and t_side in df_tr.columns:
+            def norm_side(x):
+                s = str(x).strip().lower()
+                if s in ["buy", "b", "買", "買い"]:
+                    return "BUY"
+                if s in ["sell", "s", "売", "売り"]:
+                    return "SELL"
+                return np.nan
+            df_tr[t_side] = df_tr[t_side].apply(norm_side)
+
+        st.write("#### プレビュー")
+        st.dataframe(df_tr.head(200))
+
+        with st.expander("簡易サマリ"):
+            total_rows = len(df_tr)
+            buy_n = int(df_tr[t_side].eq("BUY").sum()) if t_side else 0
+            sell_n = int(df_tr[t_side].eq("SELL").sum()) if t_side else 0
+            st.write(f"- 行数: {total_rows} / 買: {buy_n} / 売: {sell_n}")
+            if t_qty:
+                st.write(f"- 総数量: {pd.to_numeric(df_tr[t_qty], errors='coerce').sum():,.0f}")
+            if t_price:
+                st.write(f"- 価格（約定単価）min/median/max: {df_tr[t_price].min()} / {df_tr[t_price].median()} / {df_tr[t_price].max()}")
+
+        # タブ①で使うためセッション保存
+        st.session_state["trades_df"] = df_tr
+        st.session_state["trades_time_col"] = t_time
+        st.session_state["trades_price_col"] = t_price
+        st.session_state["trades_side_col"] = t_side
+
+# ---------- ③ 実現損益 ----------
+with tab3:
+    st.subheader("実現損益（CSV/TSV/Excel）")
+    st.caption("想定列： 日付 / 実現損益（列名自由、下の候補で指定）")
+    pnl_file = st.file_uploader("実現損益ファイル", type=["csv", "txt", "xlsx"], key="pnl_upl")
+    d_col_cand = st.text_input("日付 列候補", value="日付,日時,Date,date")
+    pnl_col_cand = st.text_input("損益 列候補", value="実現損益,損益,PnL,Profit,profit")
+
+    if pnl_file is None:
+        st.info("📄 ファイルを選ぶと推移と累積を描画します。")
+    else:
+        try:
+            df_pnl = load_any_table(pnl_file.name, pnl_file.getvalue(), encoding, decimal, thousands)
+        except Exception as e:
+            st.error("読み込みに失敗しました。")
+            st.exception(e)
+            st.stop()
+
+        used_enc = df_pnl.attrs.get("used_encoding")
+        used_sep = df_pnl.attrs.get("used_sep")
+        if used_enc or used_sep:
+            st.caption(f"🔎 encoding={used_enc or 'Excel'}, sep={used_sep or '(Excel)'}")
+
+        d_col = _find_first(df_pnl, _split_candidates(d_col_cand))
+        p_col = _find_first(df_pnl, _split_candidates(pnl_col_cand))
+        if d_col:
+            df_pnl[d_col] = pd.to_datetime(df_pnl[d_col], errors="coerce")
+            df_pnl = df_pnl.sort_values(d_col).set_index(d_col)
+
+        if p_col is None:
+            st.error("損益列が見つかりません。列候補に実際の列名を追記してください。")
+        else:
+            st.write("#### プレビュー")
+            st.dataframe(df_pnl[[p_col]].head(500))
+
+            st.write("#### 日次（または時系列）推移")
+            st.line_chart(df_pnl[[p_col]], height=300)
+
+            st.write("#### 累積損益")
+            cum = df_pnl[[p_col]].cumsum().rename(columns={p_col: "累積"})
+            st.line_chart(cum, height=300)
