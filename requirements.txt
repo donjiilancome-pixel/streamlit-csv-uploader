@@ -1,4 +1,7 @@
 streamlit
 pandas
 numpy
+plotly
 charset-normalizer
+openpyxl
+
