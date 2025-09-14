@@ -36,7 +36,7 @@ with st.sidebar:
 
     st.divider()
     st.header("列名の候補（カンマ区切りで追記OK）")
-    time_candidates = st.text_input("時刻/日付 列候補", value="time,Time,日時,日付,約定時間,datetime,Datetime")
+    time_candidates = st.text_input("時刻/日付 列候補", value="time,Time,日時,日付,約定時間,約定日,datetime,Datetime")
     o_col = st.text_input("始値 列候補", value="open,Open,始値")
     h_col = st.text_input("高値 列候補", value="high,High,高値")
     l_col = st.text_input("安値 列候補", value="low,Low,安値")
@@ -165,7 +165,7 @@ def cast_numeric(df: pd.DataFrame, cols: List[Optional[str]]):
         if col and col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# ====== 追加：売買/INOUT 正規化 & 数値クレンジング ======
+# ====== 売買/INOUT 正規化 & 数値クレンジング ======
 def normalize_side(val: object) -> str | float:
     """BUY/SELL を決める（買建/売建/買埋/売埋 に対応。IN/OUTは返さない）"""
     s = str(val).strip()
@@ -336,14 +336,14 @@ with tab1:
 # ---------- ② 約定履歴 ----------
 with tab2:
     st.subheader("約定履歴（CSV/TSV/Excel）")
-    st.caption("想定列： 約定時間 / 売買 / 約定数 / 約定単価（列名は任意。下の候補で指定）")
+    st.caption("想定列： 約定日/約定時間 / 売買 / 約定数 / 約定単価（列名は任意。下の候補で指定）")
     trades_file = st.file_uploader("約定履歴ファイル", type=["csv", "txt", "xlsx"], key="trades_upl")
 
-    # 列候補
+    # 列候補（既定に「約定日」「約定単価(円)」なども含める）
     t_time_c = st.text_input("（約定）時刻 列候補", value="約定日,約定時間,日時,日付,time,Time")
     t_side_c = st.text_input("売買 列候補", value="売買,side,Side,区分,取引")
-    t_qty_c  = st.text_input("数量（約定数） 列候補", value="約定数,数量,株数,約定数量,Qty,qty,サイズ")
-    t_price_c= st.text_input("価格（約定単価） 列候補", value="約定単価,単価,価格,Price,price")
+    t_qty_c  = st.text_input("数量（約定数） 列候補", value="約定数,数量,株数,約定数量,Qty,qty,サイズ,約定数量(株/口)")
+    t_price_c= st.text_input("価格（約定単価） 列候補", value="約定単価,約定単価(円),単価,価格,Price,price")
     t_inout_c= st.text_input("IN/OUT 列候補（新規/返済・エントリー/決済 等）",
                              value="IN/OUT,INOUT,新規返済,新規/返済,entry_exit,EntryExit,区分2,取引種別")
 
@@ -362,28 +362,35 @@ with tab2:
         if used_enc or used_sep:
             st.caption(f"🔎 encoding={used_enc or 'Excel'}, sep={used_sep or '(Excel)'}")
 
-    # 列検出
-    def pick(col_cands): return _find_first(df_tr, _split_candidates(col_cands))
-    t_time = pick(t_time_c); t_side = pick(t_side_c); t_qty  = pick(t_qty_c)
-    t_price = pick(t_price_c); t_inout = pick(t_inout_c)
-    
-    # 型変換
-    if t_time:
-        df_tr[t_time] = pd.to_datetime(df_tr[t_time], errors="coerce")
-    for col in [t_qty, t_price]:
-        if col and col in df_tr.columns:
-            df_tr[col] = clean_numeric_series(df_tr[col])
-    
-    # 正規化カラム（**両方あれば両方**、無ければ**売買からIN/OUTを導出**）
-    if t_side and t_side in df_tr.columns:
-        df_tr["SIDE_NORM"] = df_tr[t_side].apply(normalize_side)
-    
-    if t_inout and t_inout in df_tr.columns:
-        df_tr["INOUT_NORM"] = df_tr[t_inout].apply(normalize_inout)
-    elif t_side and t_side in df_tr.columns:
-        # **ここが重要：IN/OUT列が無くても 売買 から建/埋 を判定**
-        df_tr["INOUT_NORM"] = df_tr[t_side].apply(normalize_inout)
+        # ---- 列検出（依存関数なしの安全版）----
+        def pick_col(df: pd.DataFrame, cand_str: str) -> Optional[str]:
+            cands = [s.strip() for s in str(cand_str).split(",") if s.strip()]
+            for c in cands:
+                if c in df.columns:
+                    return c
+            return None
 
+        t_time  = pick_col(df_tr, t_time_c)
+        t_side  = pick_col(df_tr, t_side_c)
+        t_qty   = pick_col(df_tr, t_qty_c)
+        t_price = pick_col(df_tr, t_price_c)
+        t_inout = pick_col(df_tr, t_inout_c)
+
+        # 型変換
+        if t_time:
+            df_tr[t_time] = pd.to_datetime(df_tr[t_time], errors="coerce")
+        for col in [t_qty, t_price]:
+            if col and col in df_tr.columns:
+                df_tr[col] = clean_numeric_series(df_tr[col])
+
+        # 正規化カラムを追加（IN/OUT列が無くても 売買 から導出）
+        if t_side and t_side in df_tr.columns:
+            df_tr["SIDE_NORM"] = df_tr[t_side].apply(normalize_side)
+
+        if t_inout and t_inout in df_tr.columns:
+            df_tr["INOUT_NORM"] = df_tr[t_inout].apply(normalize_inout)
+        elif t_side and t_side in df_tr.columns:
+            df_tr["INOUT_NORM"] = df_tr[t_side].apply(normalize_inout)
 
         st.write("#### プレビュー")
         st.dataframe(df_tr.head(200))
@@ -413,7 +420,6 @@ with tab2:
         st.session_state["trades_price_col"] = t_price
         st.session_state["trades_side_col"] = t_side
         st.session_state["trades_inout_col"] = "INOUT_NORM" if "INOUT_NORM" in df_tr.columns else None
-
 
 # ---------- ③ 実現損益 ----------
 with tab3:
