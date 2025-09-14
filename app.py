@@ -120,7 +120,6 @@ def load_any_table(file_name: str, file_bytes: bytes, encoding_choice: str, deci
     拡張子で分岐：.xlsx は Excel、その他はテキスト表とみなす
     """
     if file_name.lower().endswith(".xlsx"):
-        # ExcelはBytesIOから読む
         return pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
     else:
         return load_text_table(file_bytes, encoding_choice, decimal, thousands)
@@ -166,6 +165,40 @@ def cast_numeric(df: pd.DataFrame, cols: List[Optional[str]]):
         if col and col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+# ====== 追加：売買/INOUT 正規化 & 数値クレンジング ======
+def normalize_side(val: object) -> str | float:
+    """BUY/SELL/IN/OUT/新規/返済/決済/ENTRY/EXIT などを共通化（SIDE用）"""
+    s = str(val).strip().lower()
+    if s in ["buy", "b", "買", "買い", "long", "現買", "新規買"]:
+        return "BUY"
+    if s in ["sell", "s", "売", "売り", "short", "現売", "新規売"]:
+        return "SELL"
+    if s in ["in", "entry", "エントリー", "新規", "新規建", "建玉", "開く"]:
+        return "IN"
+    if s in ["out", "exit", "決済", "返済", "手仕舞い", "クローズ", "閉じる", "返済買", "返済売"]:
+        return "OUT"
+    return np.nan
+
+def normalize_inout(val: object) -> str | float:
+    """IN/OUT 系だけを抽出（INOUT列が別にある場合用）"""
+    s = str(val).strip().lower()
+    if s in ["in", "entry", "エントリー", "新規", "新規建"]:
+        return "IN"
+    if s in ["out", "exit", "決済", "返済", "手仕舞い", "クローズ"]:
+        return "OUT"
+    return np.nan
+
+def clean_numeric_series(s: pd.Series) -> pd.Series:
+    """¥, 円, カンマ, 全角マイナス, (123) → -123 などを吸収して数値化"""
+    t = s.astype(str)
+    t = t.str.replace(r"\((\s*[\d,\.]+)\)", r"-\1", regex=True)  # (123) -> -123
+    t = t.str.replace("−", "-", regex=False)                    # 全角マイナス
+    t = t.str.replace(",", "", regex=False)                      # 桁区切り
+    t = t.str.replace("¥", "", regex=False).str.replace("円", "", regex=False)
+    t = t.str.replace("%", "", regex=False)                      # %除去（必要なら）
+    t = t.str.replace(r"[^\d\.\-\+eE]", "", regex=True)          # 残りの記号を除去
+    return pd.to_numeric(t, errors="coerce")
+
 # ================= セッション（約定をタブ1で使う） =================
 if "trades_df" not in st.session_state:
     st.session_state["trades_df"] = None
@@ -175,6 +208,8 @@ if "trades_price_col" not in st.session_state:
     st.session_state["trades_price_col"] = None
 if "trades_side_col" not in st.session_state:
     st.session_state["trades_side_col"] = None
+if "trades_inout_col" not in st.session_state:
+    st.session_state["trades_inout_col"] = None
 
 # ================= タブ =================
 tab1, tab2, tab3 = st.tabs(["① 3分足（OHLC）", "② 約定履歴", "③ 実現損益"])
@@ -182,7 +217,8 @@ tab1, tab2, tab3 = st.tabs(["① 3分足（OHLC）", "② 約定履歴", "③ �
 # ---------- ① 3分足（OHLC） ----------
 with tab1:
     st.subheader("3分足（OHLC）をアップロード（CSV/TSV/Excel）")
-    ohlc_file = st.file_uploader("time, open, high, low, close, volume, VWAP などを含む表", type=["csv", "txt", "xlsx"], key="ohlc_upl")
+    ohlc_file = st.file_uploader("time, open, high, low, close, volume, VWAP などを含む表",
+                                 type=["csv", "txt", "xlsx"], key="ohlc_upl")
 
     if ohlc_file is None:
         st.info("📄 ファイルを選んでください。")
@@ -244,24 +280,26 @@ with tab1:
         # 約定オーバーレイ
         overlay_ok = st.checkbox("約定履歴を重ねる（タブ②で読み込むと有効）",
                                  value=True, disabled=st.session_state["trades_df"] is None)
+
         if overlay_ok and st.session_state["trades_df"] is not None:
             tdf = st.session_state["trades_df"].copy()
             t_time = st.session_state["trades_time_col"]
             t_price = st.session_state["trades_price_col"]
-            t_side = st.session_state["trades_side_col"]
+            t_side_norm = "SIDE_NORM" if "SIDE_NORM" in tdf.columns else None
+            t_inout_norm = st.session_state.get("trades_inout_col")
 
             # 表示期間内に絞る
             if isinstance(view.index, pd.DatetimeIndex) and t_time:
                 tdf = tdf[(tdf[t_time] >= view.index.min()) & (tdf[t_time] <= view.index.max())]
 
-            # 買い/売りに分けて描画
-            if t_side and t_side in tdf.columns:
-                buys = tdf[tdf[t_side] == "BUY"]
-                sells = tdf[tdf[t_side] == "SELL"]
-            else:
-                buys, sells = tdf, pd.DataFrame(columns=tdf.columns)
+            # 価格列クレンジング（念のため）
+            if t_price and t_price in tdf.columns and not pd.api.types.is_numeric_dtype(tdf[t_price]):
+                tdf[t_price] = clean_numeric_series(tdf[t_price])
 
-            if t_time and t_price and (t_time in tdf.columns) and (t_price in tdf.columns):
+            # 1) BUY/SELL があれば描画
+            if t_side_norm and t_side_norm in tdf.columns and t_price and t_price in tdf.columns:
+                buys = tdf[tdf[t_side_norm] == "BUY"]
+                sells = tdf[tdf[t_side_norm] == "SELL"]
                 if len(buys) > 0:
                     fig.add_trace(go.Scatter(
                         x=buys[t_time], y=buys[t_price], mode="markers",
@@ -271,6 +309,21 @@ with tab1:
                     fig.add_trace(go.Scatter(
                         x=sells[t_time], y=sells[t_price], mode="markers",
                         name="売", marker_symbol="triangle-down", marker_size=10, opacity=0.9,
+                    ))
+
+            # 2) IN/OUT があれば描画（SIDEが無くても表示）
+            if t_inout_norm and t_inout_norm in tdf.columns and t_price and t_price in tdf.columns:
+                inns = tdf[tdf[t_inout_norm] == "IN"]
+                outs = tdf[tdf[t_inout_norm] == "OUT"]
+                if len(inns) > 0:
+                    fig.add_trace(go.Scatter(
+                        x=inns[t_time], y=inns[t_price], mode="markers",
+                        name="IN", marker_symbol="x", marker_size=9, opacity=0.9,
+                    ))
+                if len(outs) > 0:
+                    fig.add_trace(go.Scatter(
+                        x=outs[t_time], y=outs[t_price], mode="markers",
+                        name="OUT", marker_symbol="diamond-open", marker_size=11, opacity=0.9,
                     ))
 
         fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), xaxis_title=ohlc_time_col or "index")
@@ -287,9 +340,11 @@ with tab2:
     t_side_c = st.text_input("売買 列候補", value="売買,side,Side,区分,取引")
     t_qty_c  = st.text_input("数量（約定数） 列候補", value="約定数,数量,株数,約定数量,Qty,qty,サイズ")
     t_price_c= st.text_input("価格（約定単価） 列候補", value="約定単価,単価,価格,Price,price")
+    t_inout_c= st.text_input("IN/OUT 列候補（新規/返済・エントリー/決済 等）",
+                             value="IN/OUT,INOUT,新規返済,新規/返済,entry_exit,EntryExit,区分2,取引種別")
 
     if trades_file is None:
-        st.info("📄 ファイルを選ぶとタブ①に“買/売マーカー”を重ねられます。")
+        st.info("📄 ファイルを選ぶとタブ①に“買/売/IN/OUTマーカー”を重ねられます。")
     else:
         try:
             df_tr = load_any_table(trades_file.name, trades_file.getvalue(), encoding, decimal, thousands)
@@ -305,33 +360,37 @@ with tab2:
 
         # 列検出
         def pick(col_cands): return _find_first(df_tr, _split_candidates(col_cands))
-        t_time = pick(t_time_c); t_side = pick(t_side_c); t_qty = pick(t_qty_c); t_price = pick(t_price_c)
+        t_time = pick(t_time_c); t_side = pick(t_side_c); t_qty = pick(t_qty_c); t_price = pick(t_price_c); t_inout = pick(t_inout_c)
 
         # 型変換
         if t_time:
             df_tr[t_time] = pd.to_datetime(df_tr[t_time], errors="coerce")
         for col in [t_qty, t_price]:
             if col and col in df_tr.columns:
-                df_tr[col] = pd.to_numeric(df_tr[col], errors="coerce")
+                df_tr[col] = clean_numeric_series(df_tr[col])
 
-        # 売買正規化
+        # 正規化カラムを追加（両方あれば両方作る）
         if t_side and t_side in df_tr.columns:
-            def norm_side(x):
-                s = str(x).strip().lower()
-                if s in ["buy", "b", "買", "買い"]:
-                    return "BUY"
-                if s in ["sell", "s", "売", "売り"]:
-                    return "SELL"
-                return np.nan
-            df_tr[t_side] = df_tr[t_side].apply(norm_side)
+            df_tr["SIDE_NORM"] = df_tr[t_side].apply(normalize_side)
+        if t_inout and t_inout in df_tr.columns:
+            df_tr["INOUT_NORM"] = df_tr[t_inout].apply(normalize_inout)
 
         st.write("#### プレビュー")
         st.dataframe(df_tr.head(200))
 
+        with st.expander("検出状況（デバッグ）"):
+            st.write({
+                "time_col": t_time, "price_col": t_price, "side_col": t_side, "inout_col": t_inout
+            })
+            if "SIDE_NORM" in df_tr.columns:
+                st.write("SIDE_NORM counts:", df_tr["SIDE_NORM"].value_counts(dropna=False))
+            if "INOUT_NORM" in df_tr.columns:
+                st.write("INOUT_NORM counts:", df_tr["INOUT_NORM"].value_counts(dropna=False))
+
         with st.expander("簡易サマリ"):
             total_rows = len(df_tr)
-            buy_n = int(df_tr[t_side].eq("BUY").sum()) if t_side else 0
-            sell_n = int(df_tr[t_side].eq("SELL").sum()) if t_side else 0
+            buy_n = int(df_tr["SIDE_NORM"].eq("BUY").sum()) if "SIDE_NORM" in df_tr.columns else 0
+            sell_n = int(df_tr["SIDE_NORM"].eq("SELL").sum()) if "SIDE_NORM" in df_tr.columns else 0
             st.write(f"- 行数: {total_rows} / 買: {buy_n} / 売: {sell_n}")
             if t_qty:
                 st.write(f"- 総数量: {pd.to_numeric(df_tr[t_qty], errors='coerce').sum():,.0f}")
@@ -343,6 +402,7 @@ with tab2:
         st.session_state["trades_time_col"] = t_time
         st.session_state["trades_price_col"] = t_price
         st.session_state["trades_side_col"] = t_side
+        st.session_state["trades_inout_col"] = "INOUT_NORM" if "INOUT_NORM" in df_tr.columns else None
 
 # ---------- ③ 実現損益 ----------
 with tab3:
@@ -368,7 +428,21 @@ with tab3:
             st.caption(f"🔎 encoding={used_enc or 'Excel'}, sep={used_sep or '(Excel)'}")
 
         d_col = _find_first(df_pnl, _split_candidates(d_col_cand))
+
+        # 列候補から見つからない場合に備えて、ゆるめ検出
         p_col = _find_first(df_pnl, _split_candidates(pnl_col_cand))
+        if p_col is None:
+            tokens = ["損", "益", "損益", "実現", "pl", "p/l", "profit", "pnl", "realized"]
+            cand_names = [c for c in df_pnl.columns if any(t in str(c).lower() for t in tokens)]
+            best_col, best_ratio = None, 0.0
+            for c in cand_names:
+                ser = clean_numeric_series(df_pnl[c])
+                ratio = ser.notna().mean()
+                if ratio > best_ratio:
+                    best_ratio, best_col = ratio, c
+            if best_col is not None and best_ratio >= 0.5:
+                p_col = best_col
+
         if d_col:
             df_pnl[d_col] = pd.to_datetime(df_pnl[d_col], errors="coerce")
             df_pnl = df_pnl.sort_values(d_col).set_index(d_col)
@@ -376,6 +450,9 @@ with tab3:
         if p_col is None:
             st.error("損益列が見つかりません。列候補に実際の列名を追記してください。")
         else:
+            # 通貨記号・カンマ・括弧・全角マイナスなどを吸収
+            df_pnl[p_col] = clean_numeric_series(df_pnl[p_col])
+
             st.write("#### プレビュー")
             st.dataframe(df_pnl[[p_col]].head(500))
 
