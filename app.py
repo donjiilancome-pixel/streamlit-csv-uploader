@@ -3,11 +3,11 @@ import io, re, hashlib
 from io import StringIO
 from collections import Counter
 from datetime import date, timedelta
-from plotly.subplots import make_subplots
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 from zoneinfo import ZoneInfo
 
@@ -50,55 +50,6 @@ def to_numeric_jp(x):
         x = re.sub(r"\((\s*[\d,\.]+)\)", r"-\1", x)
         x = x.replace("−","-").replace(",","").replace("円","").replace("株","").replace("%","").strip()
     return pd.to_numeric(x, errors="coerce")
-
-def _detect_base_interval_minutes(ts: pd.Series) -> int | None:
-    """時系列の最頻インターバル（分）を推定"""
-    if ts is None or ts.empty: return None
-    t = pd.to_datetime(ts, errors="coerce")
-    if getattr(t.dtype, "tz", None) is None:
-        t = t.dt.tz_localize(TZ)
-    diffs = t.sort_values().diff().dropna().dt.total_seconds() / 60
-    if diffs.empty: return None
-    return int(round(diffs.median()))
-
-def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """
-    OHLC をリサンプリング（rule 例: '6min','9min','15min'）
-    - volume は合計、VWAP は出来高加重平均（出来高が無ければ単純平均）
-    """
-    need_cols = {"time","open","high","low","close"}
-    if df.empty or not need_cols.issubset(df.columns): 
-        return df.copy()
-
-    d = df.copy()
-    t = pd.to_datetime(d["time"], errors="coerce")
-    if getattr(t.dtype, "tz", None) is None:
-        t = t.dt.tz_localize(TZ)
-    d["time"] = t
-    d = d.set_index("time")
-
-    agg = {"open":"first","high":"max","low":"min","close":"last"}
-    if "volume" in d.columns:
-        agg["volume"] = "sum"
-
-    out = d.resample(rule, origin="start_day").agg(agg).dropna(subset=["open","high","low","close"])
-
-    # VWAP（出来高があれば加重、無ければ平均）
-    if "VWAP" in d.columns:
-        if "volume" in d.columns:
-            wnum = (d["VWAP"] * d["volume"]).resample(rule, origin="start_day").sum(min_count=1)
-            wden = d["volume"].resample(rule, origin="start_day").sum(min_count=1)
-            out["VWAP"] = (wnum / wden)
-        else:
-            out["VWAP"] = d["VWAP"].resample(rule, origin="start_day").mean()
-
-    # 任意の MA 列があれば平均でまとめる
-    for ma in ["MA1","MA2","MA3"]:
-        if ma in d.columns:
-            out[ma] = pd.to_numeric(d[ma], errors="coerce").resample(rule, origin="start_day").mean()
-
-    out = out.reset_index()
-    return out
 
 # ---- アップロード用の堅牢リーダー（CSV/TXT/XLSX）
 @st.cache_data(show_spinner=False)
@@ -710,6 +661,56 @@ def find_first_key_by_prefix(ohlc_map: dict, prefix: str, sel_date: date | None 
     cands.sort(key=score)
     return cands[0]
 
+# ======== 追加: タイムフレーム検出＆リサンプリング ========
+def _detect_base_interval_minutes(ts: pd.Series) -> int | None:
+    """時系列の最頻インターバル（分）を推定"""
+    if ts is None or ts.empty: return None
+    t = pd.to_datetime(ts, errors="coerce")
+    if getattr(t.dtype, "tz", None) is None:
+        t = t.dt.tz_localize(TZ)
+    diffs = t.sort_values().diff().dropna().dt.total_seconds() / 60
+    if diffs.empty: return None
+    return int(round(diffs.median()))
+
+def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """
+    OHLC をリサンプリング（rule 例: '6min','9min','15min'）
+    - volume は合計、VWAP は出来高加重平均（出来高が無ければ単純平均）
+    """
+    need_cols = {"time","open","high","low","close"}
+    if df.empty or not need_cols.issubset(df.columns): 
+        return df.copy()
+
+    d = df.copy()
+    t = pd.to_datetime(d["time"], errors="coerce")
+    if getattr(t.dtype, "tz", None) is None:
+        t = t.dt.tz_localize(TZ)
+    d["time"] = t
+    d = d.set_index("time")
+
+    agg = {"open":"first","high":"max","low":"min","close":"last"}
+    if "volume" in d.columns:
+        agg["volume"] = "sum"
+
+    out = d.resample(rule, origin="start_day").agg(agg).dropna(subset=["open","high","low","close"])
+
+    # VWAP（出来高があれば加重、無ければ平均）
+    if "VWAP" in d.columns:
+        if "volume" in d.columns:
+            wnum = (d["VWAP"] * d["volume"]).resample(rule, origin="start_day").sum(min_count=1)
+            wden = d["volume"].resample(rule, origin="start_day").sum(min_count=1)
+            out["VWAP"] = (wnum / wden)
+        else:
+            out["VWAP"] = d["VWAP"].resample(rule, origin="start_day").mean()
+
+    # 任意の MA 列があれば平均でまとめる
+    for ma in ["MA1","MA2","MA3"]:
+        if ma in d.columns:
+            out[ma] = pd.to_numeric(d[ma], errors="coerce").resample(rule, origin="start_day").mean()
+
+    out = out.reset_index()
+    return out
+
 # =========================================================
 # サイドバー：データアップロード & フィルタ
 # =========================================================
@@ -1047,119 +1048,124 @@ with tab5:
                 if not df_act.empty:
                     marker_groups[act] = df_act
 
-    st.caption(f"自動選択: **{code4}｜{disp_nm}**（ファイル: {auto_key}）｜IN/OUTは時刻付き約定のみ。価格欠損はOHLC近傍で補完（±6分）")
-
-    # === 表示オプション ===
-left, mid, right = st.columns([2,2,3])
-
-with left:
-    tf_label = st.selectbox("タイムフレーム", ["そのまま","6分","9分","15分"], index=0,
-                            help="元データより細かい足は作れません（3分→6/9/15分などに集約）。")
-with mid:
-    show_breaks = st.checkbox("取引時間外と昼休みを隠す（レンジブレイク）", value=True,
-                              help="土日・夜間（15:30〜翌9:00）・昼休み（11:30〜12:30）を非表示にします。")
-with right:
-    show_lines = st.multiselect(
-        "ラインの表示",
-        options=["VWAP","MA1","MA2","MA3"],
-        default=[x for x in ["VWAP","MA1","MA2"] if x in ohlc_day.columns],
+    st.caption(
+        f"自動選択: **{code4}｜{disp_nm}**（ファイル: {auto_key}）｜"
+        "IN/OUTは時刻付き約定のみ。価格欠損はOHLC近傍で補完（±6分）"
     )
 
-# タイムフレームを必要に応じてリサンプリング
-ohlc_disp = ohlc_day.copy()
-base_min = _detect_base_interval_minutes(ohlc_disp["time"])
-tf_map = {"そのまま": None, "6分":"6min", "9分":"9min", "15分":"15min"}
-target_rule = tf_map[tf_label]
-if target_rule:
-    # 目標間隔（分）
-    tgt_min = int(target_rule.replace("min",""))
-    if base_min is not None and tgt_min >= base_min:
-        ohlc_disp = _resample_ohlc(ohlc_disp, target_rule)
-    else:
-        st.caption("⚠ 元データより細かい間隔は作れないため、そのまま表示しています。")
+    # === 表示オプション ===
+    left, mid, right = st.columns([2,2,3])
+    with left:
+        tf_label = st.selectbox(
+            "タイムフレーム",
+            ["そのまま","6分","9分","15分"],
+            index=0,
+            help="元データより細かい足は作れません（3分→6/9/15分などに集約）。"
+        )
+    with mid:
+        show_breaks = st.checkbox(
+            "取引時間外と昼休みを隠す（レンジブレイク）",
+            value=True,
+            help="土日・夜間（15:30〜翌9:00）・昼休み（11:30〜12:30）を非表示にします。"
+        )
+    with right:
+        show_lines = st.multiselect(
+            "ラインの表示",
+            options=["VWAP","MA1","MA2","MA3"],
+            default=[x for x in ["VWAP","MA1","MA2"] if x in ohlc_day.columns],
+        )
 
-# === 図：上段ローソク＋下段出来高 ===
-fig = make_subplots(
-    rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28],
-    vertical_spacing=0.03, subplot_titles=("価格（ローソク）","出来高")
-)
+    # タイムフレームを必要に応じてリサンプリング
+    ohlc_disp = ohlc_day.copy()
+    base_min = _detect_base_interval_minutes(ohlc_disp["time"])
+    tf_map = {"そのまま": None, "6分":"6min", "9分":"9min", "15分":"15min"}
+    target_rule = tf_map[tf_label]
+    if target_rule:
+        tgt_min = int(target_rule.replace("min",""))
+        if base_min is not None and tgt_min >= base_min:
+            ohlc_disp = _resample_ohlc(ohlc_disp, target_rule)
+        else:
+            st.caption("⚠ 元データより細かい間隔は作れないため、そのまま表示しています。")
 
-# ローソク
-fig.add_trace(
-    go.Candlestick(
-        x=ohlc_disp["time"], open=ohlc_disp["open"], high=ohlc_disp["high"],
-        low=ohlc_disp["low"], close=ohlc_disp["close"], name="3分足"
-    ),
-    row=1, col=1
-)
+    # === 図：上段ローソク＋下段出来高 ===
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28],
+        vertical_spacing=0.03, subplot_titles=("価格（ローソク）","出来高")
+    )
 
-# 任意ライン（VWAP/MA）
-if "VWAP" in show_lines and "VWAP" in ohlc_disp.columns and ohlc_disp["VWAP"].notna().any():
-    fig.add_trace(go.Scatter(x=ohlc_disp["time"], y=ohlc_disp["VWAP"], mode="lines", name="VWAP"),
-                  row=1, col=1)
-for ma in ["MA1","MA2","MA3"]:
-    if ma in show_lines and ma in ohlc_disp.columns and ohlc_disp[ma].notna().any():
-        fig.add_trace(go.Scatter(x=ohlc_disp["time"], y=ohlc_disp[ma], mode="lines", name=ma),
-                      row=1, col=1)
-
-# 出来高（あれば）
-vol_col = next((c for c in ["volume","出来高","出来数量"] if c in ohlc_disp.columns), None)
-if vol_col:
-    fig.add_trace(go.Bar(x=ohlc_disp["time"], y=ohlc_disp[vol_col], name="出来高", opacity=0.5),
-                  row=2, col=1)
-else:
-    fig.add_trace(go.Bar(x=ohlc_disp["time"], y=[None]*len(ohlc_disp), name="出来高"),
-                  row=2, col=1)
-
-# IN/OUT／建埋マーカー
-COLOR_MAP = {"買建":"#ff69b4","売建":"#1f77b4","売埋":"#2ca02c","買埋":"#ff7f0e"}
-SYMBOL_MAP = {"買建":"triangle-up","売建":"triangle-up","売埋":"triangle-down","買埋":"triangle-down"}
-TEXT_POS   = {"買建":"top center","売建":"top center","売埋":"bottom center","買埋":"bottom center"}
-
-for act, df_act in marker_groups.items():
+    # ローソク
     fig.add_trace(
-        go.Scatter(
-            x=df_act["exec_time"], y=df_act["price"],
-            mode="markers+text",
-            text=[act]*len(df_act), textposition=TEXT_POS.get(act, "top center"),
-            marker_symbol=SYMBOL_MAP.get(act, "circle"),
-            marker_size=10,
-            marker_color=COLOR_MAP.get(act, "#444"),
-            name=act,
-            hovertemplate="時刻=%{x|%H:%M:%S}<br>価格=%{y:.2f}<extra>"+act+"</extra>",
+        go.Candlestick(
+            x=ohlc_disp["time"], open=ohlc_disp["open"], high=ohlc_disp["high"],
+            low=ohlc_disp["low"], close=ohlc_disp["close"], name="3分足"
         ),
         row=1, col=1
     )
 
-# 取引時間（縦線）とレンジブレイク
-fig.update_layout(
-    height=MAIN_CHART_HEIGHT,
-    xaxis_rangeslider_visible=False,
-    hovermode="x unified",
-    margin=dict(l=10,r=10,t=30,b=10),
-    xaxis=dict(tickformat="%H:%M")
-)
-# 当日の始終（縦線）
-fig.add_vline(x=pd.Timestamp(f"{sel_date} 09:00", tz=TZ), line=dict(width=1, dash="dot", color="#999"))
-fig.add_vline(x=pd.Timestamp(f"{sel_date} 15:30", tz=TZ), line=dict(width=1, dash="dot", color="#999"))
+    # 任意ライン（VWAP/MA）
+    if "VWAP" in show_lines and "VWAP" in ohlc_disp.columns and ohlc_disp["VWAP"].notna().any():
+        fig.add_trace(go.Scatter(x=ohlc_disp["time"], y=ohlc_disp["VWAP"], mode="lines", name="VWAP"),
+                      row=1, col=1)
+    for ma in ["MA1","MA2","MA3"]:
+        if ma in show_lines and ma in ohlc_disp.columns and ohlc_disp[ma].notna().any():
+            fig.add_trace(go.Scatter(x=ohlc_disp["time"], y=ohlc_disp[ma], mode="lines", name=ma),
+                          row=1, col=1)
 
-if show_breaks:
-    fig.update_xaxes(
-        rangebreaks=[
-            dict(bounds=["sat", "mon"]),                 # 週末
-            dict(bounds=[15.5, 9], pattern="hour"),      # 夜間（15:30〜翌9:00）
-            dict(bounds=[11.5, 12.5], pattern="hour"),   # 昼休み（11:30〜12:30）
-        ]
+    # 出来高（あれば）
+    vol_col = next((c for c in ["volume","出来高","出来数量"] if c in ohlc_disp.columns), None)
+    if vol_col:
+        fig.add_trace(go.Bar(x=ohlc_disp["time"], y=ohlc_disp[vol_col], name="出来高", opacity=0.5),
+                      row=2, col=1)
+    else:
+        fig.add_trace(go.Bar(x=ohlc_disp["time"], y=[None]*len(ohlc_disp), name="出来高"),
+                      row=2, col=1)
+
+    # IN/OUT／建埋マーカー
+    COLOR_MAP = {"買建":"#ff69b4","売建":"#1f77b4","売埋":"#2ca02c","買埋":"#ff7f0e"}
+    SYMBOL_MAP = {"買建":"triangle-up","売建":"triangle-up","売埋":"triangle-down","買埋":"triangle-down"}
+    TEXT_POS   = {"買建":"top center","売建":"top center","売埋":"bottom center","買埋":"bottom center"}
+
+    for act, df_act in marker_groups.items():
+        fig.add_trace(
+            go.Scatter(
+                x=df_act["exec_time"], y=df_act["price"],
+                mode="markers+text",
+                text=[act]*len(df_act), textposition=TEXT_POS.get(act, "top center"),
+                marker_symbol=SYMBOL_MAP.get(act, "circle"),
+                marker_size=10,
+                marker_color=COLOR_MAP.get(act, "#444"),
+                name=act,
+                hovertemplate="時刻=%{x|%H:%M:%S}<br>価格=%{y:.2f}<extra>"+act+"</extra>",
+            ),
+            row=1, col=1
+        )
+
+    # 取引時間（縦線）とレンジブレイク
+    fig.update_layout(
+        height=MAIN_CHART_HEIGHT,
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        margin=dict(l=10,r=10,t=30,b=10),
+        xaxis=dict(tickformat="%H:%M")
     )
+    # 当日の始終（縦線）
+    fig.add_vline(x=pd.Timestamp(f"{sel_date} 09:00", tz=TZ), line=dict(width=1, dash="dot", color="#999"))
+    fig.add_vline(x=pd.Timestamp(f"{sel_date} 15:30", tz=TZ), line=dict(width=1, dash="dot", color="#999"))
 
-# 表示範囲は当日の場中
-start_dt = pd.Timestamp(f"{sel_date} 09:00", tz=TZ)
-end_dt   = pd.Timestamp(f"{sel_date} 15:30", tz=TZ)
-fig.update_xaxes(range=[start_dt, end_dt], row=1, col=1)
-fig.update_xaxes(range=[start_dt, end_dt], row=2, col=1)
+    if show_breaks:
+        fig.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),                 # 週末
+                dict(bounds=[15.5, 9], pattern="hour"),      # 夜間（15:30〜翌9:00）
+                dict(bounds=[11.5, 12.5], pattern="hour"),   # 昼休み（11:30〜12:30）
+            ]
+        )
 
-st.plotly_chart(fig, use_container_width=True)
+    # 表示範囲は当日の場中
+    fig.update_xaxes(range=[start_dt, end_dt], row=1, col=1)
+    fig.update_xaxes(range=[start_dt, end_dt], row=2, col=1)
 
+    st.plotly_chart(fig, use_container_width=True)
 
-    if skipped_price>0:
+    if skipped_price > 0:
         st.warning(f"価格を補完できずマーカーを表示できなかった約定: {skipped_price} 件（±6分に足が無い 等）")
