@@ -310,60 +310,69 @@ with tab1:
         if cols.vwap and cols.vwap in view.columns:
             fig.add_trace(go.Scatter(x=x, y=view[cols.vwap], mode="lines", name="VWAP", opacity=0.85))
 
-        # 約定オーバーレイ
-        overlay_ok = st.checkbox("約定履歴を重ねる（タブ②で読み込むと有効）",
-                                 value=True, disabled=st.session_state["trades_df"] is None)
-
+        # 約定オーバーレイ（安全版）
+        overlay_ok = st.checkbox(
+            "約定履歴を重ねる（タブ②で読み込むと有効）",
+            value=True,
+            disabled=st.session_state["trades_df"] is None,
+        )
+        
         if overlay_ok and st.session_state["trades_df"] is not None:
             tdf = st.session_state["trades_df"].copy()
-            t_time = st.session_state["trades_time_col"]
-            t_price = st.session_state["trades_price_col"]
+        
+            # セッションから列名を取得（None 安全）
+            t_time_col  = st.session_state.get("trades_time_col")
+            t_price_col = st.session_state.get("trades_price_col")
             t_side_norm = "SIDE_NORM" if "SIDE_NORM" in tdf.columns else None
-            t_inout_norm = st.session_state.get("trades_inout_col")
+            t_inout_norm= st.session_state.get("trades_inout_col")
+        
+            # 列の存在チェック（無ければオーバーレイせず注意書き）
+            if not t_time_col or t_time_col not in tdf.columns:
+                st.caption("⚠ 約定の時刻列が見つからないため、オーバーレイをスキップしました。")
+            else:
+                # 価格列クレンジング（存在すれば）
+                if t_price_col and t_price_col in tdf.columns and not pd.api.types.is_numeric_dtype(tdf[t_price_col]):
+                    tdf[t_price_col] = clean_numeric_series(tdf[t_price_col])
+        
+                # 表示期間内に絞る（両者とも tz なしに統一して比較）
+                if isinstance(view.index, pd.DatetimeIndex):
+                    idx_naive = _drop_tz_index(view.index)
+                    t_series  = _drop_tz_series(tdf[t_time_col])
+                    if len(idx_naive) > 0:
+                        min_ts, max_ts = idx_naive.min(), idx_naive.max()
+                        mask = (t_series >= min_ts) & (t_series <= max_ts)
+                        tdf = tdf[mask]
+        
+                # 1) BUY/SELL があれば描画
+                if t_side_norm and t_side_norm in tdf.columns and t_price_col and t_price_col in tdf.columns:
+                    buys  = tdf[tdf[t_side_norm] == "BUY"]
+                    sells = tdf[tdf[t_side_norm] == "SELL"]
+                    if len(buys) > 0:
+                        fig.add_trace(go.Scatter(
+                            x=buys[t_time_col], y=buys[t_price_col], mode="markers",
+                            name="買", marker_symbol="triangle-up", marker_size=10, opacity=0.9,
+                        ))
+                    if len(sells) > 0:
+                        fig.add_trace(go.Scatter(
+                            x=sells[t_time_col], y=sells[t_price_col], mode="markers",
+                            name="売", marker_symbol="triangle-down", marker_size=10, opacity=0.9,
+                        ))
+        
+                # 2) IN/OUT があれば描画（SIDE が無くても表示）
+                if t_inout_norm and t_inout_norm in tdf.columns and t_price_col and t_price_col in tdf.columns:
+                    inns = tdf[tdf[t_inout_norm] == "IN"]
+                    outs = tdf[tdf[t_inout_norm] == "OUT"]
+                    if len(inns) > 0:
+                        fig.add_trace(go.Scatter(
+                            x=inns[t_time_col], y=inns[t_price_col], mode="markers",
+                            name="IN", marker_symbol="x", marker_size=9, opacity=0.9,
+                        ))
+                    if len(outs) > 0:
+                        fig.add_trace(go.Scatter(
+                            x=outs[t_time_col], y=outs[t_price_col], mode="markers",
+                            name="OUT", marker_symbol="diamond-open", marker_size=11, opacity=0.9,
+                        ))
 
-            # 表示期間内に絞る（両者とも tz なしに統一して比較）
-        if isinstance(view.index, pd.DatetimeIndex) and t_time:
-            idx_naive = _drop_tz_index(view.index)
-            t_series  = _drop_tz_series(tdf[t_time])
-            min_ts, max_ts = idx_naive.min(), idx_naive.max()
-            tdf = tdf[(t_series >= min_ts) & (t_series <= max_ts)]
-
-
-            # 価格列クレンジング（念のため）
-            if t_price and t_price in tdf.columns and not pd.api.types.is_numeric_dtype(tdf[t_price]):
-                tdf[t_price] = clean_numeric_series(tdf[t_price])
-
-            # 1) BUY/SELL があれば描画
-            if t_side_norm and t_side_norm in tdf.columns and t_price and t_price in tdf.columns:
-                buys = tdf[tdf[t_side_norm] == "BUY"]
-                sells = tdf[tdf[t_side_norm] == "SELL"]
-                if len(buys) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=buys[t_time], y=buys[t_price], mode="markers",
-                        name="買", marker_symbol="triangle-up", marker_size=10, opacity=0.9,
-                    ))
-                if len(sells) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=sells[t_time], y=sells[t_price], mode="markers",
-                        name="売", marker_symbol="triangle-down", marker_size=10, opacity=0.9,
-                    ))
-
-            # 2) IN/OUT があれば描画（SIDEが無くても表示）
-            if t_inout_norm and t_inout_norm in tdf.columns and t_price and t_price in tdf.columns:
-                inns = tdf[tdf[t_inout_norm] == "IN"]
-                outs = tdf[tdf[t_inout_norm] == "OUT"]
-                if len(inns) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=inns[t_time], y=inns[t_price], mode="markers",
-                        name="IN", marker_symbol="x", marker_size=9, opacity=0.9,
-                    ))
-                if len(outs) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=outs[t_time], y=outs[t_price], mode="markers",
-                        name="OUT", marker_symbol="diamond-open", marker_size=11, opacity=0.9,
-                    ))
-
-        fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), xaxis_title=ohlc_time_col or "index")
         st.plotly_chart(fig, use_container_width=True)
 
 # ---------- ② 約定履歴 ----------
