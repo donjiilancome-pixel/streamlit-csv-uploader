@@ -1,0 +1,7 @@
+[server]
+# アップロード上限を増やしたいときだけ有効化（MB）
+# maxUploadSize = 200
+
+[theme]
+base="light"
+primaryColor="#0F6CBD"
