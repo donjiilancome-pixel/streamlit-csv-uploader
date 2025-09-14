@@ -1,525 +1,997 @@
-import io
-import csv
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
+# -*- coding: utf-8 -*-
+import io, re, hashlib
+from io import StringIO
+from collections import Counter
+from datetime import date, timedelta
 
-import pandas as pd
 import numpy as np
-import streamlit as st
+import pandas as pd
 import plotly.graph_objects as go
+import streamlit as st
+from zoneinfo import ZoneInfo
 
-# 文字コード推定（無くても動くようにtry）
-try:
-    from charset_normalizer import from_bytes as cn_from_bytes
-except Exception:
-    cn_from_bytes = None
+# =========================================================
+# 基本設定
+# =========================================================
+st.set_page_config(page_title="デイトレ結果ダッシュボード", page_icon="📈", layout="wide")
+st.title("📈 デイトレ結果ダッシュボード（VWAP/MA対応・3分足＋IN/OUT）")
+st.caption("複数ファイルアップロード対応・3分足: Asia/Tokyo / 9:00–15:30・信用区分フィルタ（全体/一般=デイ/制度=スイング）")
 
-st.set_page_config(page_title="3分足＋約定オーバーレイ（実現損益付き）", layout="wide")
-st.title("CSV/Excelアップロード：3分足（OHLC）＋約定オーバーレイ＋実現損益")
-st.caption("タブごとにCSV/Excelをアップロード。文字コード・区切りは自動判別にも対応。")
+TZ = ZoneInfo("Asia/Tokyo")
+MAIN_CHART_HEIGHT = 600  # メイン/先物/日経 すべて統一
 
-# ================= サイドバー（共通設定） =================
-with st.sidebar:
-    st.header("読み込み設定")
-    encoding = st.selectbox(
-        "文字コード",
-        options=[
-            "auto (自動判別)", "utf-8", "utf-8-sig",
-            "cp932 (Shift_JIS)", "utf-16", "utf-16-le", "utf-16-be",
-            "euc_jp", "iso2022_jp"
-        ],
-        index=0,
-        help="不明なときは『auto』でOK。Excel/TSV/セミコロン区切りも自動で推定します。",
-    )
-    decimal = st.selectbox("小数点記号", options=[".", ","], index=0)
-    thousands = st.selectbox("桁区切り", options=[None, ",", "_", " "], index=0)
+# =========================================================
+# ユーティリティ（元コード互換）
+# =========================================================
+def _clean_colname(name: str) -> str:
+    if name is None: return ""
+    s = str(name).replace("\ufeff","").replace("\u3000"," ")
+    return re.sub(r"\s+"," ", s.strip())
 
-    st.divider()
-    st.header("列名の候補（カンマ区切りで追記OK）")
-    time_candidates = st.text_input("時刻/日付 列候補", value="time,Time,日時,日付,約定時間,約定日,datetime,Datetime")
-    o_col = st.text_input("始値 列候補", value="open,Open,始値")
-    h_col = st.text_input("高値 列候補", value="high,High,高値")
-    l_col = st.text_input("安値 列候補", value="low,Low,安値")
-    c_col = st.text_input("終値 列候補", value="close,Close,終値")
-    v_col = st.text_input("出来高 列候補", value="volume,出来高")
-    vwap_col = st.text_input("VWAP 列候補", value="VWAP,vwap")
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return df
+    return df.rename(columns={c:_clean_colname(c) for c in df.columns})
 
-# ================= ユーティリティ =================
-def _drop_tz_index(idx):
-    """DatetimeIndex の tz を外して naive に統一"""
-    if isinstance(idx, pd.DatetimeIndex):
+def to_numeric_jp(x):
+    if isinstance(x, pd.Series):
+        s = (x.astype(str)
+               .str.replace(",", "", regex=False)
+               .str.replace("円", "", regex=False)
+               .str.replace("株", "", regex=False)
+               .str.strip())
+        return pd.to_numeric(s, errors="coerce")
+    if pd.isna(x): return np.nan
+    if isinstance(x, str):
+        x = x.replace(",", "").replace("円", "").replace("株", "").strip()
+    return pd.to_numeric(x, errors="coerce")
+
+# ---- アップロード用の堅牢リーダー（CSV/TXT/XLSX）
+@st.cache_data(show_spinner=False)
+def read_table_from_upload(file_name: str, file_bytes: bytes) -> pd.DataFrame:
+    # Excel
+    if file_name.lower().endswith(".xlsx"):
         try:
-            return idx.tz_localize(None)
+            return clean_columns(pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl"))
         except Exception:
-            try:
-                return idx.tz_convert(None)
-            except Exception:
-                return idx
-    return idx
+            return pd.DataFrame()
 
-def _drop_tz_series(s: pd.Series) -> pd.Series:
-    """Series[datetime] の tz を外して naive に統一"""
-    if not isinstance(s, pd.Series):
-        return s
-    # 一度 datetime 型へ
-    s = pd.to_datetime(s, errors="coerce")
-    # tz を外す
+    # テキスト（CSV/TSV/その他区切り）
+    text = None
+    # まずは候補エンコーディングで順に try
+    for enc in ["utf-8-sig","utf-8","cp932","shift_jis","euc_jp"]:
+        try:
+            text = file_bytes.decode(enc)
+            break
+        except Exception:
+            continue
+    if text is None:
+        try:
+            text = file_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            return pd.DataFrame()
+
+    # 区切り推定
+    sample = text[:20000]
+    sep = None
+    if sample.count("\t") >= 2 and sample.count("\t") > sample.count(","): sep = "\t"
+    elif sample.count(";") >= 2 and sample.count(";") > sample.count(","): sep = ";"
+    elif sample.count("|") >= 2 and sample.count("|") > sample.count(","): sep = "|"
+
     try:
-        return s.dt.tz_localize(None)
+        df = pd.read_csv(StringIO(text), sep=sep, engine="python")
+        return clean_columns(df)
     except Exception:
         try:
-            return s.dt.tz_convert(None)
+            # セパレーター指定なしで最終トライ
+            df = pd.read_csv(StringIO(text), engine="python")
+            return clean_columns(df)
         except Exception:
-            return s
+            return pd.DataFrame()
 
-def _split_candidates(s: str) -> List[str]:
-    return [x.strip() for x in s.split(",") if x.strip()]
+def files_signature(files) -> str:
+    """アップロード複数ファイルのキャッシュキー生成"""
+    if not files: return ""
+    parts = []
+    for f in files:
+        b = f.getvalue()
+        h = hashlib.md5(b).hexdigest()
+        parts.append(f"{f.name}|{len(b)}|{h[:8]}")
+    return hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()
 
-def _find_first(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    for c in candidates:
-        if c in df.columns:
-            return c
+@st.cache_data(show_spinner=False)
+def concat_uploaded_tables(files, sig: str, add_source_col: bool=True) -> pd.DataFrame:
+    if not files: return pd.DataFrame()
+    frames = []
+    for f in files:
+        df = read_table_from_upload(f.name, f.getvalue())
+        if df.empty: continue
+        if add_source_col:
+            df = df.copy(); df["__source_file__"] = f.name
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+
+# =========================================================
+# 銘柄コード/名称 正規化（元コード互換）
+# =========================================================
+def normalize_symbol_cols(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return df
+    d = df.copy()
+
+    def extract_code_from_series(s: pd.Series) -> pd.Series:
+        if s is None:
+            return pd.Series([pd.NA]*len(d), index=d.index, dtype="object")
+        ss = s.astype(str).str.strip().str.upper().str.replace(".0","",regex=False)
+        s1 = ss.str.extract(r'(?i)(\d{4,5}[A-Z])')[0]  # 285A等
+        s2 = ss.str.extract(r'(\d{4,5})')[0]           # 7974等
+        return s1.fillna(s2)
+
+    code = pd.Series([pd.NA]*len(d), index=d.index, dtype="object")
+    for col in ["コード4","銘柄コード","コード"]:
+        if col in d.columns: code = code.fillna(extract_code_from_series(d[col]))
+    for col in ["銘柄名","名称","銘柄"]:
+        if col in d.columns: code = code.fillna(extract_code_from_series(d[col]))
+    if "__source_file__" in d.columns:
+        sf = d["__source_file__"].astype(str)
+        s1 = sf.str.extract(r'_(?i:(\d{4,5}[A-Z]))(?=[,_\.])')[0]
+        s2 = sf.str.extract(r'_(\d{4,5})(?=[,_\.])')[0]
+        code = code.fillna(s1.fillna(s2))
+
+    d["code_key"] = pd.Series(code, dtype="string").str.upper().str.strip()
+    d["code_key"] = d["code_key"].replace({"":"<NA>","NAN":"<NA>"}).replace("<NA>", pd.NA)
+
+    name = None
+    for col in ["銘柄名","名称","銘柄"]:
+        if col in d.columns:
+            s = d[col].astype(str).str.replace("\u3000"," ", regex=False).str.strip()
+            name = s if name is None else name.fillna(s)
+    d["name_key"] = name if name is not None else ""
+    return d
+
+def representative_name(df: pd.DataFrame) -> str:
+    names = [x for x in df["name_key"].dropna().astype(str).tolist() if x and x.lower()!="nan"]
+    if not names: return ""
+    return Counter(names).most_common(1)[0][0]
+
+def build_code_to_name_map(*dfs: pd.DataFrame) -> dict:
+    mp = {}
+    for df in dfs:
+        if df is None or df.empty: continue
+        d = normalize_symbol_cols(df)
+        if "code_key" not in d.columns: continue
+        grp = d[d["code_key"].notna() & (d["code_key"]!="")]
+        if grp.empty: continue
+        name_map = grp.groupby("code_key").apply(representative_name)
+        for ck, nm in name_map.items():
+            if isinstance(ck, str) and ck and nm:
+                mp.setdefault(ck, nm)
+    return mp
+
+# =========================================================
+# 実現損益・約定の正規化（元コード互換）
+# =========================================================
+def normalize_realized(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return df
+    d = df.copy()
+    if "約定日" in d.columns:
+        d["約定日"] = pd.to_datetime(d["約定日"], errors="coerce")
+    if "実現損益[円]" in d.columns:
+        d["実現損益[円"] = to_numeric_jp(d["実現損益[円]"])
+    return normalize_symbol_cols(d)
+
+def normalize_yakujyou(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return df
+    d = normalize_symbol_cols(df.copy())
+    return d
+
+def lr_from_realized_trade(val: str) -> str | None:
+    if val is None or (isinstance(val, float) and pd.isna(val)): return None
+    s = str(val).replace("　","").replace(" ","")
+    if "売埋" in s or ("売" in s and "返済" in s): return "LONG"
+    if "買埋" in s or ("買" in s and "返済" in s): return "SHORT"
+    if "買建" in s or "売建" in s: return None
+    sl = s.lower()
+    if "sell" in sl and "close" in sl: return "LONG"
+    if "buy" in sl and "close" in sl:  return "SHORT"
     return None
 
-@st.cache_data(show_spinner=True)
-def load_text_table(file_bytes: bytes, encoding_choice: str, decimal: str, thousands):
-    """
-    CSV/TSV/セミコロン/パイプ区切りのテキスト表を読み込む。
-    - 文字コード：自動判別 + BOMヒューリスティクス + フォールバック候補
-    - 区切り文字：csv.Sniffer + ヒューリスティクス
-    """
-    # 文字コード候補を組み立て
-    candidates = []
-    if encoding_choice.startswith("auto"):
-        b = file_bytes
-        if b.startswith(b"\xff\xfe") or b.startswith(b"\xfe\xff"):
-            candidates.append("utf-16")
-        elif b.startswith(b"\xef\xbb\xbf"):
-            candidates.append("utf-8-sig")
-        if cn_from_bytes is not None:
-            try:
-                best = cn_from_bytes(b).best()
-                if best and best.encoding:
-                    candidates.insert(0, best.encoding)
-            except Exception:
-                pass
-        candidates += ["utf-8", "cp932", "utf-16", "utf-16-le", "utf-16-be", "euc_jp", "iso2022_jp"]
-    else:
-        candidates = ["cp932" if "cp932" in encoding_choice else encoding_choice]
+# ---- 約定 → IN/OUT マーカー生成（元コード互換）
+def pick_dt_col(df: pd.DataFrame, preferred=None) -> str | None:
+    if df is None or df.empty: return None
+    cands = preferred or ["約定日","約定日時","約定日付","日時"]
+    for c in cands:
+        if c in df.columns: return c
+    for c in df.columns:
+        if re.search(r"約定.*(日|時)|日時", str(c)): return c
+    return None
 
-    last_err = None
-    for enc in dict.fromkeys(candidates):  # 重複除去しつつ順番維持
-        try:
-            text = file_bytes.decode(enc, errors="strict")
-            sample = text[:20000]
-            sep = None
-            try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=[",", "\t", ";", "|"])
-                sep = dialect.delimiter
-            except Exception:
-                # ざっくりヒューリスティクス
-                if sample.count("\t") > sample.count(",") and sample.count("\t") >= 2:
-                    sep = "\t"
-                elif sample.count(";") > sample.count(",") and sample.count(";") >= 2:
-                    sep = ";"
-                elif sample.count("|") > sample.count(",") and sample.count("|") >= 2:
-                    sep = "|"
+def pick_time_col(df: pd.DataFrame, preferred=None) -> str | None:
+    if df is None or df.empty: return None
+    cands = preferred or ["約定時刻","約定時間","時刻","時間"]
+    for c in cands:
+        if c in df.columns: return c
+    for c in df.columns:
+        if re.search(r"(約定)?(時刻|時間)", str(c)): return c
+    return None
 
-            df = pd.read_csv(
-                io.StringIO(text),
-                sep=sep,
-                decimal=decimal,
-                thousands=None if thousands in (None, "None", "") else thousands,
-                engine="python",
-            )
-            df.attrs["used_encoding"] = enc
-            df.attrs["used_sep"] = sep or ","
-            return df
-        except Exception as e:
-            last_err = e
-            continue
-    # すべて失敗した場合は最後の例外を投げる
-    raise last_err
+def parse_time_only_to_timedelta(s: pd.Series) -> pd.Series:
+    ss = s.astype(str).str.strip().str.replace("：",":", regex=False)
+    out = pd.Series(pd.NaT, index=ss.index, dtype="timedelta64[ns]")
+    as_num = pd.to_numeric(ss, errors="coerce")
+    mask_frac = as_num.notna() & (as_num>=0) & (as_num<=1)
+    if mask_frac.any():
+        secs = (as_num[mask_frac]*86400).round().astype(int)
+        out.loc[mask_frac] = pd.to_timedelta(secs, unit="s")
+    mask_hms = ss.str.match(r"^\d{1,2}:\d{1,2}(:\d{1,2})?$")
+    out.loc[mask_hms] = pd.to_timedelta(ss.loc[mask_hms])
+    mask_kanji = ss.str.match(r"^\d{1,2}時\d{1,2}分(\d{1,2}秒)?$")
+    if mask_kanji.any():
+        def jp_to_hms(x):
+            m = re.match(r"^(\d{1,2})時(\d{1,2})分(?:(\d{1,2})秒)?$", x)
+            hh,mm,ss_ = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+            return pd.to_timedelta(f"{hh:02d}:{mm:02d}:{ss_:02d}")
+        out.loc[mask_kanji] = ss.loc[mask_kanji].map(jp_to_hms)
+    mask_num = ss.str.match(r"^\d{3,6}$")
+    if mask_num.any():
+        def num_to_hms(x):
+            x = x.zfill(6); hh,mm,ss_ = int(x[:2]), int(x[2:4]), int(x[4:6])
+            return pd.to_timedelta(f"{hh:02d}:{mm:02d}:{ss_:02d}")
+        out.loc[mask_num] = ss.loc[mask_num].map(num_to_hms)
+    return out
 
-@st.cache_data(show_spinner=True)
-def load_any_table(file_name: str, file_bytes: bytes, encoding_choice: str, decimal: str, thousands):
-    """
-    拡張子で分岐：.xlsx は Excel、その他はテキスト表とみなす
-    """
-    if file_name.lower().endswith(".xlsx"):
-        return pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
-    else:
-        return load_text_table(file_bytes, encoding_choice, decimal, thousands)
+def combine_date_time_cols(df: pd.DataFrame, date_col: str, time_col: str) -> pd.Series:
+    d = pd.to_datetime(df[date_col], errors="coerce", infer_datetime_format=True).dt.date
+    base_time = parse_time_only_to_timedelta(df[time_col]) if time_col in df.columns else pd.Series(pd.NaT, index=df.index)
+    dt_str = df[date_col].astype(str)
+    tail_num = dt_str.str.extract(r"(\d{3,6})\s*$")[0]
+    mask_fill = base_time.isna() & tail_num.notna()
+    if mask_fill.any():
+        base_time.loc[mask_fill] = parse_time_only_to_timedelta(tail_num.loc[mask_fill])
+    ts = pd.to_datetime(d) + base_time
+    return pd.to_datetime(ts, errors="coerce").dt.tz_localize(TZ)
 
-def parse_datetime_index(df: pd.DataFrame, time_cols: List[str]) -> Tuple[pd.DataFrame, Optional[str]]:
-    col = _find_first(df, time_cols)
-    if col is None:
-        return df, None
-    s = _drop_tz_series(df[col])                 # ← tz を除去してから
-    df[col] = s
-    df = df.sort_values(col)
-    try:
-        df = df.set_index(col)
-        df.index = _drop_tz_index(df.index)      # ← 念のため index 側も tz 除去
-    except Exception:
-        pass
-    return df, col
+def parse_datetime_from_dtcol(df: pd.DataFrame, dtcol: str) -> pd.Series:
+    s = df[dtcol].astype(str).str.strip().str.replace("：",":", regex=False)
+    date_part = s.str.extract(r"^(\d{4}[/-]\d{1,2}[/-]\d{1,2})")[0]
+    d = pd.to_datetime(date_part, errors="coerce").dt.date
+    t_hms  = s.str.extract(r"\b(\d{1,2}:\d{1,2}(?::\d{1,2})?)\b")[0]
+    t_kan  = s.str.extract(r"\b(\d{1,2}時\d{1,2}分(?:\d{1,2}秒)?)\b")[0]
+    t_tail = s.str.extract(r"\s(\d{3,6})\s*$")[0]
+    t_str = t_hms.fillna(t_kan).fillna(t_tail).fillna("")
+    td = parse_time_only_to_timedelta(t_str)
+    ts = pd.to_datetime(d) + td
+    return pd.to_datetime(ts, errors="coerce").dt.tz_localize(TZ)
 
+PRICE_CANDS = ["約定単価(円)","約定単価（円）","約定価格","価格","約定単価"]
+def select_price_series(df: pd.DataFrame) -> pd.Series | None:
+    for c in PRICE_CANDS:
+        if c in df.columns: return to_numeric_jp(df[c])
+    pat = re.compile(r"(約定)?.*(単価|価格)")
+    best,nn = None,-1
+    for c in df.columns:
+        if pat.search(str(c)):
+            s = to_numeric_jp(df[c]); k = s.notna().sum()
+            if k>nn: best,nn = c,k
+    return to_numeric_jp(df[best]) if best else None
 
-@dataclass
-class OHLCCols:
-    open: str
-    high: str
-    low: str
-    close: str
-    volume: Optional[str] = None
-    vwap: Optional[str] = None
+def select_qty_series(df: pd.DataFrame) -> pd.Series | None:
+    cand_exact = [
+        "約定数量", "約定数量(株)", "約定数量（株）", "約定株数",
+        "出来数量", "数量", "株数", "出来高",
+        "約定数量(口)", "口数"
+    ]
+    for c in cand_exact:
+        if c in df.columns:
+            return to_numeric_jp(df[c])
+    best, nn = None, -1
+    for c in df.columns:
+        cname = str(c).replace(" ", "")
+        if any(k in cname for k in ["数量", "株数", "口数", "出来高"]):
+            s = to_numeric_jp(df[c])
+            k = s.notna().sum()
+            if k > nn:
+                best, nn = c, k
+    return to_numeric_jp(df[best]) if best else None
 
-def detect_ohlc_cols(df: pd.DataFrame,
-                     o_cands: List[str], h_cands: List[str],
-                     l_cands: List[str], c_cands: List[str],
-                     v_cands: List[str], vwap_cands: List[str]) -> Optional[OHLCCols]:
-    o = _find_first(df, o_cands)
-    h = _find_first(df, h_cands)
-    l = _find_first(df, l_cands)
-    c = _find_first(df, c_cands)
-    if not all([o, h, l, c]):
+def side_to_io(val: str) -> str | None:
+    if val is None or (isinstance(val,float) and np.isnan(val)): return None
+    s = str(val).replace("　","").replace(" ","").lower()
+    if "買建" in s or ("buy" in s and "close" not in s):  return "IN"
+    if "売建" in s or ("sell" in s and "close" not in s): return "IN"
+    if "売埋" in s or "売返済" in s or ("sell" in s and "close" in s): return "OUT"
+    if "買埋" in s or "買返済" in s or ("buy" in s and "close" in s):  return "OUT"
+    return None
+
+def side_to_action(val: str) -> str | None:
+    if val is None or (isinstance(val, float) and np.isnan(val)):
         return None
-    v = _find_first(df, v_cands)
-    vwap = _find_first(df, vwap_cands)
-    return OHLCCols(open=o, high=h, low=l, close=c, volume=v, vwap=vwap)
+    s = str(val).replace("　","").replace(" ","").lower()
+    if "買建" in s: return "買建"
+    if "売建" in s: return "売建"
+    if ("売埋" in s) or ("売返済" in s): return "売埋"
+    if ("買埋" in s) or ("買返済" in s): return "買埋"
+    if "buy" in s and "close" not in s:  return "買建"
+    if "sell" in s and "close" not in s: return "売建"
+    if "sell" in s and "close" in s:     return "売埋"
+    if "buy" in s and "close" in s:      return "買埋"
+    return None
 
-def cast_numeric(df: pd.DataFrame, cols: List[Optional[str]]):
-    for col in cols:
-        if col and col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+def pick_side_column_any(df: pd.DataFrame) -> str | None:
+    for c in ["売買","売買区分","売買種別","Side","取引"]:
+        if c in df.columns: return c
+    for c in df.columns:
+        if "売買" in c or "side" in c.lower() or "取引" in c: return c
+    return None
 
-# ====== 売買/INOUT 正規化 & 数値クレンジング ======
-def normalize_side(val: object) -> str | float:
-    """BUY/SELL を決める（買建/売建/買埋/売埋 に対応。IN/OUTは返さない）"""
-    s = str(val).strip()
-    sl = s.lower()
-    # 英語・略称
-    if sl in ["buy", "b", "long", "現買", "新規買"]:
-        return "BUY"
-    if sl in ["sell", "s", "short", "現売", "新規売"]:
-        return "SELL"
-    # 日本語（建/埋 含む）
-    if "買" in s:   # 買建/買埋/買 など
-        return "BUY"
-    if "売" in s:   # 売建/売埋/売 など
-        return "SELL"
-    return np.nan
+def build_exec_table_allperiod(yj_all: pd.DataFrame) -> pd.DataFrame:
+    if yj_all is None or yj_all.empty:
+        return pd.DataFrame(columns=["code_key","name_key","exec_time","price","io","action"])
+    d = yj_all.copy()
 
-def normalize_inout(val: object) -> str | float:
-    """IN/OUT を決める（建=IN / 埋=OUT を判定）"""
-    s = str(val).strip()
-    sl = s.lower()
-    if sl in ["in", "entry", "エントリー", "新規", "新規建"] or ("建" in s):
-        return "IN"
-    if sl in ["out", "exit", "決済", "返済", "手仕舞い", "クローズ"] or ("埋" in s):
-        return "OUT"
-    return np.nan
+    dtcol = pick_dt_col(d); tmcol = pick_time_col(d)
+    if dtcol is None:
+        return pd.DataFrame(columns=["code_key","name_key","exec_time","price","io","action"])
 
-def clean_numeric_series(s: pd.Series) -> pd.Series:
-    """¥, 円, カンマ, 全角マイナス, (123) → -123 などを吸収して数値化"""
-    t = s.astype(str)
-    t = t.str.replace(r"\((\s*[\d,\.]+)\)", r"-\1", regex=True)  # (123) -> -123
-    t = t.str.replace("−", "-", regex=False)                    # 全角マイナス
-    t = t.str.replace(",", "", regex=False)                      # 桁区切り
-    t = t.str.replace("¥", "", regex=False).str.replace("円", "", regex=False)
-    t = t.str.replace("%", "", regex=False)                      # %除去（必要なら）
-    t = t.str.replace(r"[^\d\.\-\+eE]", "", regex=True)          # 残りの記号を除去
-    return pd.to_numeric(t, errors="coerce")
+    def has_time_rowwise(row):
+        val_dt = str(row.get(dtcol, "")).strip()
+        val_tm = str(row.get(tmcol, "")).strip() if tmcol else ""
+        if val_tm:
+            return True
+        if re.search(r"[:：]", val_dt): return True
+        if re.search(r"\b\d{3,6}\b", val_dt): return True
+        if re.search(r"時\d{1,2}分", val_dt): return True
+        return False
 
-# ================= セッション（約定をタブ1で使う） =================
-if "trades_df" not in st.session_state:
-    st.session_state["trades_df"] = None
-if "trades_time_col" not in st.session_state:
-    st.session_state["trades_time_col"] = None
-if "trades_price_col" not in st.session_state:
-    st.session_state["trades_price_col"] = None
-if "trades_side_col" not in st.session_state:
-    st.session_state["trades_side_col"] = None
-if "trades_inout_col" not in st.session_state:
-    st.session_state["trades_inout_col"] = None
+    mask_time = d.apply(has_time_rowwise, axis=1)
+    d = d.loc[mask_time].copy()
+    if d.empty:
+        return pd.DataFrame(columns=["code_key","name_key","exec_time","price","io","action"])
 
-# ================= タブ =================
-tab1, tab2, tab3 = st.tabs(["① 3分足（OHLC）", "② 約定履歴", "③ 実現損益"])
-
-# ---------- ① 3分足（OHLC） ----------
-with tab1:
-    st.subheader("3分足（OHLC）をアップロード（CSV/TSV/Excel）")
-    ohlc_file = st.file_uploader("time, open, high, low, close, volume, VWAP などを含む表",
-                                 type=["csv", "txt", "xlsx"], key="ohlc_upl")
-
-    if ohlc_file is None:
-        st.info("📄 ファイルを選んでください。")
+    if tmcol:
+        exec_ts = combine_date_time_cols(d, dtcol, tmcol)
     else:
-        try:
-            df_ohlc = load_any_table(ohlc_file.name, ohlc_file.getvalue(), encoding, decimal, thousands)
-        except Exception as e:
-            st.error("読み込みに失敗しました。サイドバーの文字コードや区切りを見直すか、Excel/CSVの形式をご確認ください。")
-            st.exception(e)
-            st.stop()
+        exec_ts = parse_datetime_from_dtcol(d, dtcol)
+    d["exec_time"] = exec_ts
 
-        # 参考情報（何で読めたか）
-        used_enc = df_ohlc.attrs.get("used_encoding")
-        used_sep = df_ohlc.attrs.get("used_sep")
-        if used_enc or used_sep:
-            st.caption(f"🔎 encoding={used_enc or 'Excel'}, sep={used_sep or '(Excel)'}")
+    price_series = select_price_series(d)
+    d["price"] = price_series if price_series is not None else np.nan
 
-        # 時刻→インデックス
-        df_ohlc, ohlc_time_col = parse_datetime_index(df_ohlc, _split_candidates(time_candidates))
-        # 列検出
-        cols = detect_ohlc_cols(
-            df_ohlc,
-            _split_candidates(o_col), _split_candidates(h_col),
-            _split_candidates(l_col), _split_candidates(c_col),
-            _split_candidates(v_col), _split_candidates(vwap_col),
-        )
-        if cols is None:
-            st.error("OHLC列（始値/高値/安値/終値）が見つかりません。サイドバーの候補に実際の列名を追記して再読込してください。")
-            st.stop()
+    d = normalize_symbol_cols(d)
 
-        # 数値化
-        cast_numeric(df_ohlc, [cols.open, cols.high, cols.low, cols.close, cols.volume, cols.vwap])
+    side_col = pick_side_column_any(d)
+    d["io"] = d[side_col].map(side_to_io) if side_col else None
+    d["action"] = d[side_col].map(side_to_action) if side_col else None
 
-        st.write("#### プレビュー")
-        st.dataframe(df_ohlc.head(100))
+    cols = ["code_key","name_key","exec_time","price","io","action"]
+    out = d[cols].dropna(subset=["exec_time"]).copy()
+    out["code_key"] = out["code_key"].astype("string").str.upper().str.strip().replace({"":"<NA>","NAN":"<NA>"}).replace("<NA>", pd.NA)
+    return out
 
-        # 表示範囲
-        st.write("#### 表示範囲（任意）")
-        if isinstance(df_ohlc.index, pd.DatetimeIndex) and len(df_ohlc) > 1:
-            min_d, max_d = df_ohlc.index.min(), df_ohlc.index.max()
-            rng = st.slider("期間を指定", min_value=min_d.to_pydatetime(), max_value=max_d.to_pydatetime(),
-                            value=(min_d.to_pydatetime(), max_d.to_pydatetime()))
-            view = df_ohlc.loc[(df_ohlc.index >= rng[0]) & (df_ohlc.index <= rng[1])].copy()
+def build_trade_table_for_display(yakujyou_all: pd.DataFrame, sel_date: date, code4: str) -> pd.DataFrame:
+    if yakujyou_all is None or yakujyou_all.empty:
+        return pd.DataFrame(columns=["約定時間","売買","約定数","約定単価"])
+
+    d = normalize_symbol_cols(yakujyou_all.copy())
+
+    dtcol = pick_dt_col(d)
+    tmcol = pick_time_col(d)
+    if dtcol is None:
+        return pd.DataFrame(columns=["約定時間","売買","約定数","約定単価"])
+
+    if tmcol:
+        ts = combine_date_time_cols(d, dtcol, tmcol)
+    else:
+        ts = parse_datetime_from_dtcol(d, dtcol)
+    d["__exec_time__"] = ts
+
+    d["code_key"] = d["code_key"].astype("string").str.upper().str.strip()
+    mask = (d["code_key"] == str(code4).upper()) & (d["__exec_time__"].dt.tz_convert(TZ).dt.date == sel_date)
+    d = d.loc[mask].copy()
+    if d.empty:
+        return pd.DataFrame(columns=["約定時間","売買","約定数","約定単価"])
+
+    side_col = pick_side_column_any(d)
+    if side_col:
+        side_series = d[side_col].astype(str)
+        action_series = d[side_col].map(side_to_action)
+        side_series = side_series.where(side_series.str.strip().ne(""), action_series)
+    else:
+        side_series = d.get("action", None)
+
+    qty_series   = select_qty_series(d)
+    price_series = select_price_series(d)
+
+    out = pd.DataFrame({
+        "約定時間": d["__exec_time__"].dt.tz_convert(TZ).dt.strftime("%H:%M:%S"),
+        "売買": side_series,
+        "約定数": qty_series,
+        "約定単価": price_series,
+    })
+    out = out.sort_values("約定時間").reset_index(drop=True)
+    return out
+
+# =========================================================
+# 3分足ロード（アップロード群から作る）
+# =========================================================
+@st.cache_data(show_spinner=False)
+def load_ohlc_map_from_uploads(files, sig: str):
+    """
+    time, open, high, low, close を必須とし、任意で VWAP, MA1, MA2, MA3 を取り込む。
+    キーはアップロード時のファイル名（拡張子除く）。
+    """
+    ohlc_map = {}
+    if not files: return ohlc_map
+    for f in files:
+        df = read_table_from_upload(f.name, f.getvalue())
+        if df.empty: continue
+
+        # --- 必須列 検出＆リネーム（柔軟化） ---
+        col_rename_map, found_cols = {}, {}
+        CANDIDATES = {
+            "time": ["time", "日時"],
+            "open": ["open", "始値"],
+            "high": ["high", "高値"],
+            "low": ["low", "安値"],
+            "close": ["close", "終値"],
+        }
+        original_cols = {c.lower(): c for c in df.columns}
+        for std, cands in CANDIDATES.items():
+            for cand in cands:
+                if cand in original_cols:
+                    col_rename_map[original_cols[cand]] = std
+                    found_cols[std] = True
+                    break
+        if len(found_cols) < len(CANDIDATES):
+            continue
+
+        df = df.rename(columns=col_rename_map)
+
+        t = pd.to_datetime(df["time"], errors="coerce", infer_datetime_format=True)
+        if getattr(t.dtype, "tz", None) is None: t = t.dt.tz_localize(TZ)
+        else: t = t.dt.tz_convert(TZ)
+        df = df.copy()
+        df["time"] = t
+
+        def pick_one(df, names):
+            for n in names:
+                if n in df.columns: return df[n]
+            return None
+        vwap = pick_one(df, ["VWAP","vwap","Vwap"])
+        ma1  = pick_one(df, ["MA1","ma1","Ma1"])
+        ma2  = pick_one(df, ["MA2","ma2","Ma2"])
+        ma3  = pick_one(df, ["MA3","ma3","Ma3"])
+        if vwap is not None: df["VWAP"] = pd.to_numeric(vwap, errors="coerce")
+        if ma1  is not None: df["MA1"]  = pd.to_numeric(ma1,  errors="coerce")
+        if ma2  is not None: df["MA2"]  = pd.to_numeric(ma2,  errors="coerce")
+        if ma3  is not None: df["MA3"]  = pd.to_numeric(ma3,  errors="coerce")
+
+        df = df.dropna(subset=["time"]).sort_values("time")
+        df = df.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
+
+        key = f.name.rsplit(".",1)[0]  # 拡張子除く
+        ohlc_map[key] = df
+    return ohlc_map
+
+def extract_code_from_ohlc_key(key: str):
+    m = re.search(r'_(?i:(\d{3,5}[a-z]))(?=[,_])', key)  # 285Aなど
+    if m: return m.group(1).upper()
+    m2 = re.search(r'_(\d{4,5})(?=[,_])', key)           # 7974など
+    if m2: return m2.group(1)
+    return None
+
+def build_ohlc_code_index(ohlc_map: dict):
+    idx = {}
+    for k in ohlc_map.keys():
+        c = extract_code_from_ohlc_key(k)
+        if c:
+            idx.setdefault(c.upper(), []).append(k)
+    return idx
+
+def ohlc_global_date_range(ohlc_map: dict):
+    if not ohlc_map: return None, None
+    mins, maxs = [], []
+    for df in ohlc_map.values():
+        if df is None or df.empty or "time" not in df.columns: continue
+        t = df["time"]
+        t = t.dt.tz_localize(TZ) if getattr(t.dtype,"tz",None) is None else t.dt.tz_convert(TZ)
+        if t.notna().any():
+            mins.append(t.min().date()); maxs.append(t.max().date())
+    if not mins or not maxs: return None, None
+    return min(mins), max(maxs)
+
+def market_time(sel_date: date, start_str="09:00", end_str="15:30"):
+    return pd.Timestamp(f"{sel_date} {start_str}", tz=TZ), pd.Timestamp(f"{sel_date} {end_str}", tz=TZ)
+
+def slice_window_with_fallback(df: pd.DataFrame, sel_date: date) -> tuple[pd.DataFrame, str]:
+    note = ""
+    if df.empty or "time" not in df.columns:
+        return df.head(0), "該当日のデータが見つかりませんでした。"
+
+    t = df["time"]
+    if getattr(t.dtype,"tz",None) is None:
+        t_local = pd.to_datetime(t, errors="coerce").dt.tz_localize(TZ)
+    else:
+        t_local = pd.to_datetime(t, errors="coerce").dt.tz_convert(TZ)
+    base = df.copy(); base["time"] = t_local
+
+    s,e = market_time(sel_date, "09:00", "15:30")
+    out = base.loc[(base["time"]>=s)&(base["time"]<=e)]
+    if not out.empty:
+        return out.copy(), note
+
+    if getattr(t.dtype,"tz",None) is None:
+        t_utc = pd.to_datetime(t, errors="coerce").dt.tz_localize("UTC").dt.tz_convert(TZ)
+        base2 = df.copy(); base2["time"] = t_utc
+        out2 = base2.loc[(base2["time"]>=s)&(base2["time"]<=e)]
+        if not out2.empty:
+            return out2.copy(), "指数/先物CSVの time を UTC として再解釈しました。"
+
+    s2,e2 = market_time(sel_date, "08:45", "15:30")
+    out = base.loc[(base["time"]>=s2)&(base["time"]<=e2)]
+    if not out.empty:
+        return out.copy(), "8:45–15:30 に拡大して抽出しました。"
+
+    out = base.loc[base["time"].dt.date == sel_date]
+    if not out.empty:
+        return out.copy(), "当日の終日データで表示しました。"
+
+    df_dates = base["time"].dt.date
+    if df_dates.empty:
+        return base.head(0), "該当日の近傍にもデータが見つかりませんでした。"
+    diffs = (pd.to_datetime(df_dates) - pd.Timestamp(sel_date)).abs()
+    idx = diffs.values.argmin()
+    nearest_day = df_dates.iloc[idx]
+    out = base.loc[df_dates==nearest_day]
+    if not out.empty:
+        return out.copy(), f"{sel_date} にデータが無いため {nearest_day} のデータを表示しています。"
+
+    return base.head(0), "該当日のデータが見つかりませんでした。"
+
+def pick_best_ohlc_key_for_date(code4: str, ohlc_code_index: dict, ohlc_map: dict, sel_date) -> tuple[str|None, pd.DataFrame|None, str]:
+    keys = ohlc_code_index.get(str(code4).upper(), [])
+    if not keys: return None, None, "該当キーなし"
+    start_dt, end_dt = market_time(sel_date)
+    candidates, dbg = [], []
+    for k in keys:
+        df = ohlc_map.get(k)
+        if df is None or df.empty or "time" not in df.columns:
+            dbg.append(f"{k}: データなし/列不備"); continue
+        t = df["time"]
+        t = t.dt.tz_localize(TZ) if getattr(t.dtype,"tz",None) is None else t.dt.tz_convert(TZ)
+        tmin, tmax = t.min(), t.max()
+        dbg.append(f"{k}: [{tmin} .. {tmax}]")
+        in_win = (t>=start_dt)&(t<=end_dt)
+        same_day = (t.dt.date==sel_date)
+        day_dist = float("inf")
+        if t.notna().any():
+            sel_start = pd.Timestamp(sel_date, tz=TZ)
+            if (t.dt.date==sel_date).any(): day_dist = 0.0
+            elif tmax < sel_start: day_dist = (sel_start - tmax).total_seconds()
+            elif tmin > sel_start: day_dist = (tmin - sel_start).total_seconds()
+            else: day_dist = 0.0
+        score = (0 if in_win.any() else (1 if same_day.any() else 2), 0 if same_day.any() else 1, day_dist)
+        candidates.append((score,k,df))
+    if not candidates: return None, None, "候補なし"
+    candidates.sort(key=lambda x:x[0])
+    best = candidates[0]
+    return best[1], best[2], " / ".join(dbg)+f" => PICK: {best[1]}"
+
+def download_button_df(df, label, filename):
+    csv = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
+
+def compute_max_drawdown(series: pd.Series) -> float:
+    if series is None or series.empty: return np.nan
+    arr = series.to_numpy(dtype=float)
+    peak, max_dd = -np.inf, 0.0
+    for x in arr:
+        peak = max(peak, x); max_dd = max(max_dd, peak - x)
+    return float(max_dd)
+
+def find_first_key_by_prefix(ohlc_map: dict, prefix: str, sel_date: date | None = None) -> str | None:
+    if not ohlc_map: return None
+    pfx = prefix.lower()
+    cands = [k for k in ohlc_map.keys() if k.lower().startswith(pfx)]
+    if not cands: return None
+
+    def norm_t(s: pd.Series):
+        return s.dt.tz_localize(TZ) if getattr(s.dtype,"tz",None) is None else s.dt.tz_convert(TZ)
+
+    if sel_date is None:
+        best = max(cands, key=lambda k: norm_t(ohlc_map[k]["time"]).max())
+        return best
+
+    s_dt, e_dt = market_time(sel_date)
+    def score(k):
+        t = norm_t(ohlc_map[k]["time"])
+        if t.empty:
+            return (3, float("inf"), float("-inf"))
+        in_win   = ((t>=s_dt)&(t<=e_dt)).any()
+        same_day = (t.dt.date==sel_date).any()
+        sel_ts   = pd.Timestamp(sel_date, tz=TZ)
+        tmin, tmax = t.min(), t.max()
+        if tmax < sel_ts:
+            dd = (sel_ts - tmax).total_seconds()
+        elif tmin > sel_ts:
+            dd = (tmin - sel_ts).total_seconds()
         else:
-            view = df_ohlc.copy()
+            dd = 0.0
+        return (0 if in_win else (1 if same_day else 2), dd, -tmax.value)
 
-        # ローソク足
-        fig = go.Figure()
-        x = view.index if isinstance(view.index, pd.DatetimeIndex) else np.arange(len(view))
-        fig.add_trace(go.Candlestick(
-            x=x, open=view[cols.open], high=view[cols.high],
-            low=view[cols.low], close=view[cols.close], name="OHLC",
+    cands.sort(key=score)
+    return cands[0]
+
+# =========================================================
+# サイドバー：データアップロード & フィルタ
+# =========================================================
+st.sidebar.header("① データアップロード（複数ファイルまとめてOK）")
+realized_files = st.sidebar.file_uploader("実現損益 CSV/Excel", type=["csv","txt","xlsx"], accept_multiple_files=True)
+yakujyou_files = st.sidebar.file_uploader("約定履歴 CSV/Excel", type=["csv","txt","xlsx"], accept_multiple_files=True)
+ohlc_files     = st.sidebar.file_uploader("3分足 OHLC CSV/Excel（ファイル名末尾に _7974 などのコードを含める）", type=["csv","txt","xlsx"], accept_multiple_files=True)
+
+sig_realized = files_signature(realized_files)
+sig_yakujyou = files_signature(yakujyou_files)
+sig_ohlc     = files_signature(ohlc_files)
+
+yakujyou_all = concat_uploaded_tables(yakujyou_files, sig_yakujyou)
+yakujyou_all = normalize_yakujyou(clean_columns(yakujyou_all))
+
+realized = concat_uploaded_tables(realized_files, sig_realized)
+realized = normalize_realized(clean_columns(realized))
+
+ohlc_map = load_ohlc_map_from_uploads(ohlc_files, sig_ohlc)
+CODE_TO_NAME = build_code_to_name_map(realized, yakujyou_all)
+
+# 信用区分フィルタ
+st.sidebar.header("② トレード種別フィルタ")
+trade_type = st.sidebar.radio("対象", ["全体","デイトレード（一般）","スイングトレード（制度）"], index=0)
+
+def apply_trade_type_filter(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "信用区分" not in df.columns: return df
+    if trade_type.startswith("全体"): return df
+    if "デイトレ" in trade_type: return df[df["信用区分"]=="一般"]
+    if "スイング" in trade_type: return df[df["信用区分"]=="制度"]
+    return df
+
+# 期間フィルタ（KPIや集計用）
+st.subheader("期間フィルタ")
+c1,c2,c3 = st.columns([2,2,3])
+with c1:
+    span = st.radio("クイック選択", ["全期間","今日","今週","今月","今年","カスタム"], horizontal=True, index=0, key="span")
+with c2:
+    start = st.date_input("開始日", value=date.today()-timedelta(days=30), disabled=(span!="カスタム"))
+with c3:
+    end = st.date_input("終了日", value=date.today(), disabled=(span!="カスタム"))
+
+def filter_by_span(df, dt_col):
+    if df.empty or dt_col not in df.columns: return df
+    dt = pd.to_datetime(df[dt_col], errors="coerce")
+    today = date.today()
+    if span=="全期間": return df
+    if span=="今日": s,e = today, today
+    elif span=="今週":
+        mon = today - timedelta(days=today.weekday()); s,e = mon, mon+timedelta(days=6)
+    elif span=="今月":
+        first = today.replace(day=1)
+        next_f = date(first.year+1,1,1) if first.month==12 else date(first.year, first.month+1, 1)
+        s,e = first, next_f - timedelta(days=1)
+    elif span=="今年":
+        s,e = date(today.year,1,1), date(today.year,12,31)
+    else:
+        s,e = start, end
+    mask = (dt.dt.date>=s)&(dt.dt.date<=e)
+    return df.loc[mask]
+
+realized_f = apply_trade_type_filter(filter_by_span(realized, "約定日"))
+
+# =========================================================
+# KPI
+# =========================================================
+st.subheader("KPI")
+
+pl = None
+if not realized_f.empty and "実現損益[円]" in realized_f.columns:
+    pl = to_numeric_jp(realized_f["実現損益[円]"]).dropna()
+
+c1,c2,c3 = st.columns(3)
+with c1:
+    total_pl = pl.sum() if pl is not None and not pl.empty else np.nan
+    st.metric("実現損益（選択期間）", f"{int(total_pl):,} 円" if pd.notna(total_pl) else "—")
+with c2:
+    n_trades = int(pl.shape[0]) if pl is not None else 0
+    st.metric("取引回数", f"{n_trades:,}" if n_trades else "—")
+with c3:
+    avg_pl = pl.mean() if pl is not None and not pl.empty else np.nan
+    st.metric("平均損益（/回）", f"{int(round(avg_pl)):,} 円" if pd.notna(avg_pl) else "—")
+
+c4,c5,c6 = st.columns(3)
+with c4:
+    win_rate = (pl>0).mean()*100 if pl is not None and not pl.empty else np.nan
+    st.metric("勝率（全体）", f"{win_rate:.1f}%" if pd.notna(win_rate) else "—")
+
+wr_long = wr_short = np.nan
+if not realized_f.empty and ("取引" in realized_f.columns):
+    rj = realized_f.copy()
+    rj["PL"] = to_numeric_jp(rj["実現損益[円]"])
+    rj["LR"] = rj["取引"].map(lr_from_realized_trade)
+    pl_long  = rj.loc[rj["LR"]=="LONG","PL"]
+    pl_short = rj.loc[rj["LR"]=="SHORT","PL"]
+    wr_long  = (pl_long>0).mean()*100  if pl_long.notna().any()  else np.nan
+    wr_short = (pl_short>0).mean()*100 if pl_short.notna().any() else np.nan
+
+with c5: st.metric("勝率（ロング）", f"{wr_long:.1f}%" if pd.notna(wr_long) else "—")
+with c6: st.metric("勝率（ショート）", f"{wr_short:.1f}%" if pd.notna(wr_short) else "—")
+
+# 最大DD
+c7,_c8,_c9 = st.columns(3)
+with c7:
+    if not realized_f.empty and "約定日" in realized_f.columns and "実現損益[円]" in realized_f.columns:
+        tmp = realized_f.copy()
+        tmp["日"] = pd.to_datetime(tmp["約定日"], errors="coerce").dt.date
+        seq = tmp.groupby("日", as_index=False)["実現損益[円]"].sum().sort_values("日")
+        seq["累計"] = seq["実現損益[円]"].cumsum()
+        dd = compute_max_drawdown(seq["累計"])
+        st.metric("最大ドローダウン", f"{int(round(dd)):,} 円" if pd.notna(dd) else "—")
+    else:
+        st.metric("最大ドローダウン", "—")
+
+# =========================================================
+# タブ
+# =========================================================
+tab1,tab2,tab3,tab4,tab5 = st.tabs(["集計（期間別）","累計損益","個別銘柄","ランキング","3分足 IN/OUT + 指標"])
+
+# ---- 1) 期間別
+with tab1:
+    st.markdown("### 実現損益（期間別集計）")
+    if realized_f.empty:
+        st.info("実現損益データが必要です。")
+    else:
+        r = realized_f.copy()
+        dts = pd.to_datetime(r["約定日"], errors="coerce")
+        r["日"] = dts.dt.date
+        r["週"] = (dts - pd.to_timedelta(dts.dt.weekday, unit="D")).dt.date
+        r["月"] = dts.dt.to_period("M").dt.to_timestamp().dt.date
+        r["年"] = dts.dt.to_period("Y").dt.to_timestamp().dt.date
+        for label,col in [("日別","日"),("週別","週"),("月別","月"),("年別","年")]:
+            g = r.groupby(col, as_index=False)["実現損益[円]"].sum().sort_values(col)
+            st.write(f"**{label}**")
+            st.dataframe(g, use_container_width=True, hide_index=True)
+            download_button_df(g, f"⬇ CSVダウンロード（{label}）", f"{col}_pl.csv")
+            fig_bar = go.Figure([go.Bar(x=g[col], y=g["実現損益[円]"], name=f"{label} 実現損益")])
+            fig_bar.update_layout(margin=dict(l=10,r=10,t=20,b=10), height=300, xaxis_title=label, yaxis_title="実現損益[円]")
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+# ---- 2) 累計
+with tab2:
+    st.markdown("### 累計実現損益（選択期間内、日次ベース）")
+    if realized_f.empty:
+        st.info("実現損益データが必要です。")
+    else:
+        d = realized_f.copy()
+        d["日"] = pd.to_datetime(d["約定日"]).dt.date
+        seq = d.groupby("日", as_index=False)["実現損益[円]"].sum().sort_values("日")
+        seq["累計"] = seq["実現損益[円]"].cumsum()
+        seq_disp = seq.copy()
+        seq_disp["実現損益[円]"] = seq_disp["実現損益[円]"].round(0).astype("Int64")
+        seq_disp["累計"] = seq_disp["累計"].round(0).astype("Int64")
+        st.dataframe(seq_disp, use_container_width=True, hide_index=True)
+        download_button_df(seq_disp, "⬇ CSVダウンロード（累計・日次）", "cumulative_daily_pl.csv")
+        left,right = st.columns(2)
+        with left:
+            fig_bar = go.Figure([go.Bar(x=seq["日"], y=seq["実現損益[円]"], name="日次 実現損益")])
+            fig_bar.update_layout(margin=dict(l=10,r=10,t=20,b=10), height=350, xaxis_title="日付", yaxis_title="実現損益[円]")
+            st.plotly_chart(fig_bar, use_container_width=True)
+        with right:
+            fig_line = go.Figure([go.Scatter(x=seq["日"], y=seq["累計"], mode="lines", name="累計")])
+            fig_line.update_layout(margin=dict(l=10,r=10,t=20,b=10), height=350, xaxis_title="日付", yaxis_title="累計実現損益[円]")
+            st.plotly_chart(fig_line, use_container_width=True)
+
+# ---- 3) 個別銘柄
+def per_symbol_stats(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["銘柄コード","銘柄名","実現損益合計","取引回数","1回平均損益","勝率"])
+    d = normalize_symbol_cols(df.copy())
+    if "実現損益[円]" in d.columns: d["実現損益"] = to_numeric_jp(d["実現損益[円]"])
+    else:
+        cand = next((c for c in d.columns if ("実現" in str(c) and "損益" in str(c))), None)
+        if cand is None: 
+            return pd.DataFrame(columns=["銘柄コード","銘柄名","実現損益合計","取引回数","1回平均損益","勝率"])
+        d["実現損益"] = to_numeric_jp(d[cand])
+    d["win"] = d["実現損益"]>0
+    d["group_key"] = np.where(d["code_key"].notna()&(d["code_key"]!=""), d["code_key"], "NAMEONLY::"+d["name_key"].astype(str))
+    agg = d.groupby("group_key").agg({"実現損益":["sum","count","mean"], "win":["mean"]})
+    agg.columns = ["実現損益合計","取引回数","1回平均損益","勝率"]
+    rep_name = d.groupby("group_key").apply(representative_name).rename("銘柄名")
+    code_col = d.groupby("group_key")["code_key"].first().rename("銘柄コード")
+    out = agg.join(rep_name).join(code_col).reset_index(drop=True).sort_values("実現損益合計", ascending=False)
+    out["銘柄コード"] = out["銘柄コード"].fillna("—")
+    return out
+
+with tab3:
+    st.markdown("### 個別銘柄（勝率・実現損益）")
+    if realized_f.empty:
+        st.info("実現損益データが必要です。")
+    else:
+        sym = per_symbol_stats(realized_f)
+        if not sym.empty:
+            disp = sym.copy()
+            if "1回平均損益" in disp.columns: disp["1回平均損益"] = disp["1回平均損益"].round(0).astype("Int64")
+            if "勝率" in disp.columns: disp["勝率"] = (disp["勝率"]*100).round(1).map(lambda x: f"{x:.1f}%")
+            order = ["銘柄コード","銘柄名","実現損益合計","取引回数","1回平均損益","勝率"]
+            cols = [c for c in order if c in disp.columns] + [c for c in disp.columns if c not in order]
+            st.dataframe(disp[cols], use_container_width=True, hide_index=True)
+            download_button_df(disp[cols], "⬇ CSVダウンロード（個別銘柄）", "per_symbol_stats.csv")
+        else:
+            st.info("集計できるデータがありません。")
+
+# ---- 4) ランキング
+with tab4:
+    st.markdown("### ランキング（選択期間）")
+    if realized_f.empty:
+        st.info("実現損益データが必要です。")
+    else:
+        d = normalize_symbol_cols(realized_f.copy())
+        d["実現損益"] = d["実現損益[円]"]
+        d["group_key"] = np.where(d["code_key"].notna()&(d["code_key"]!=""), d["code_key"], "NAMEONLY::"+d["name_key"].astype(str))
+        by_symbol = d.groupby("group_key").agg({"実現損益":["count","sum","mean"]})
+        by_symbol.columns = ["取引回数","実現損益合計","1回平均損益"]
+        rep_name = d.groupby("group_key").apply(representative_name).rename("銘柄名")
+        code_col = d.groupby("group_key")["code_key"].first().rename("銘柄コード")
+        out = by_symbol.join(rep_name).join(code_col).reset_index(drop=True)
+        out["銘柄コード"] = out["銘柄コード"].fillna("—")
+        if "1回平均損益" in out.columns: out["1回平均損益"] = out["1回平均損益"].round(0).astype("Int64")
+        left,right = st.columns(2)
+        with left:
+            sort_key = st.selectbox("ソート指標", ["実現損益合計","取引回数","1回平均損益"], index=0)
+        with right:
+            topn = st.slider("表示件数", 5, 100, 20)
+        out = out.sort_values(sort_key, ascending=False).head(topn)
+        order = ["銘柄コード","銘柄名","実現損益合計","取引回数","1回平均損益"]
+        cols = [c for c in order if c in out.columns] + [c for c in out.columns if c not in order]
+        st.dataframe(out[cols], use_container_width=True, hide_index=True)
+        download_button_df(out[cols], "⬇ CSVダウンロード（ランキング）", "ranking.csv")
+
+# ---- 5) 3分足 IN/OUT + VWAP/MA
+with tab5:
+    st.markdown("### 個別銘柄の3分足 + IN/OUT（当日指定｜時刻付き約定のみ）＋ 指標（VWAP/MA）")
+
+    exec_all = build_exec_table_allperiod(yakujyou_all) if not yakujyou_all.empty else pd.DataFrame()
+
+    ohlc_min_d, ohlc_max_d = ohlc_global_date_range(ohlc_map)
+    allow_ohlc_only = st.checkbox("約定が無い日でも3分足を表示する", value=True)
+    if allow_ohlc_only and (ohlc_min_d is not None) and (ohlc_max_d is not None):
+        default_d = ohlc_max_d
+        sel_date = st.date_input("日付を選択", value=default_d, min_value=ohlc_min_d, max_value=ohlc_max_d)
+    else:
+        if not exec_all.empty:
+            dates = sorted(exec_all["exec_time"].dt.date.dropna().unique().tolist())
+            if dates:
+                sel_date = st.date_input("日付を選択（IN/OUTがある日）", value=dates[-1], min_value=dates[0], max_value=dates[-1])
+            else:
+                sel_date = st.date_input("日付を選択", value=date.today())
+        else:
+            sel_date = st.date_input("日付を選択", value=date.today())
+
+    ohlc_code_index = build_ohlc_code_index(ohlc_map)
+    all_codes_in_ohlc = sorted(ohlc_code_index.keys())
+    sel_options = []
+    if not exec_all.empty:
+        day_exec = exec_all[exec_all["exec_time"].dt.date == sel_date]
+        sel_options = sorted(day_exec["code_key"].dropna().unique().tolist())
+    if not sel_options and all_codes_in_ohlc:
+        sel_options = all_codes_in_ohlc
+    if not sel_options:
+        st.warning("表示できる銘柄データ（約定履歴 or 3分足）がありません。")
+        st.stop()
+
+    CODE_TO_NAME = build_code_to_name_map(realized, yakujyou_all)
+    selected_code = st.selectbox(
+        "銘柄を選択",
+        options=sel_options,
+        index=0,
+        format_func=lambda c: f"{c}｜{CODE_TO_NAME.get(str(c).upper(), '名称不明')}"
+    )
+    if not selected_code: st.stop()
+    code4 = str(selected_code).upper()
+    disp_nm = CODE_TO_NAME.get(code4, "名称不明")
+
+    st.markdown("#### 約定履歴（当日）")
+    trades_tbl = build_trade_table_for_display(yakujyou_all, sel_date, code4)
+    if trades_tbl.empty:
+        st.info("当日の約定履歴がありません。")
+    else:
+        st.dataframe(trades_tbl, use_container_width=True, hide_index=True)
+        download_button_df(trades_tbl, "⬇ CSVダウンロード（約定履歴・当日）", f"trades_{code4}_{sel_date}.csv")
+
+    best_key, ohlc, dbg = pick_best_ohlc_key_for_date(code4, ohlc_code_index, ohlc_map, sel_date)
+    if best_key is None or ohlc is None or ohlc.empty:
+        st.error(f"銘柄コード {code4} の3分足データが見つかりません。"
+                 "\nヒント：3分足ファイル名の末尾に `_7974` のようなコードを含めてください。")
+        st.stop()
+    auto_key = best_key
+
+    if getattr(ohlc["time"].dtype,"tz",None) is None:
+        ohlc["time"] = pd.to_datetime(ohlc["time"], errors="coerce").dt.tz_localize(TZ)
+    else:
+        ohlc["time"] = ohlc["time"].dt.tz_convert(TZ)
+    start_dt = pd.Timestamp(f"{sel_date} 09:00", tz=TZ)
+    end_dt   = pd.Timestamp(f"{sel_date} 15:30", tz=TZ)
+    ohlc_day = ohlc.loc[(ohlc["time"]>=start_dt) & (ohlc["time"]<=end_dt)].copy()
+    if ohlc_day.empty:
+        st.warning(f"{sel_date} の {code4} の3分足データがありません。")
+        st.stop()
+
+    marker_groups = {}
+    skipped_price = 0
+    if not exec_all.empty:
+        marks = exec_all[(exec_all["exec_time"].dt.date == sel_date) & (exec_all["code_key"]==code4)].copy()
+        in_window = (marks["exec_time"]>=start_dt) & (marks["exec_time"]<=end_dt)
+        marks = marks.loc[in_window].copy()
+        if not marks.empty:
+            ohlc_idx = (ohlc_day[["time","close"]]
+                        .rename(columns={"time":"ohlc_time","close":"ohlc_close"})
+                        .sort_values("ohlc_time"))
+            mk = marks.sort_values("exec_time").copy()
+            mk["exec_time_floor"] = mk["exec_time"]
+            merged = pd.merge_asof(
+                mk.sort_values("exec_time_floor"),
+                ohlc_idx,
+                left_on="exec_time_floor",
+                right_on="ohlc_time",
+                direction="nearest",
+                tolerance=pd.Timedelta("6min")
+            )
+            merged["price"] = merged["price"].fillna(merged["ohlc_close"])
+            skipped_price = merged["price"].isna().sum()
+            merged = merged.dropna(subset=["price"])
+
+            for act in ["買建","売建","売埋","買埋"]:
+                df_act = merged[merged["action"]==act][["exec_time","price"]].copy()
+                if not df_act.empty:
+                    marker_groups[act] = df_act
+
+    st.caption(f"自動選択: **{code4}｜{disp_nm}**（ファイル: {auto_key}）｜IN/OUTは時刻付き約定のみ。価格欠損はOHLC近傍で補完（±6分）")
+
+    fig = go.Figure([go.Candlestick(
+        x=ohlc_day["time"], open=ohlc_day["open"], high=ohlc_day["high"],
+        low=ohlc_day["low"], close=ohlc_day["close"], name="3分足"
+    )])
+
+    if "VWAP" in ohlc_day.columns and ohlc_day["VWAP"].notna().any():
+        fig.add_trace(go.Scatter(x=ohlc_day["time"], y=ohlc_day["VWAP"], mode="lines",
+                                 line=dict(color="#808080", width=2), name="VWAP"))
+    if "MA1" in ohlc_day.columns and ohlc_day["MA1"].notna().any():
+        fig.add_trace(go.Scatter(x=ohlc_day["time"], y=ohlc_day["MA1"], mode="lines",
+                                 line=dict(color="#2ca02c", width=1.8), name="MA1"))
+    if "MA2" in ohlc_day.columns and ohlc_day["MA2"].notna().any():
+        fig.add_trace(go.Scatter(x=ohlc_day["time"], y=ohlc_day["MA2"], mode="lines",
+                                 line=dict(color="#ffda00", width=1.8), name="MA2"))
+    if "MA3" in ohlc_day.columns and ohlc_day["MA3"].notna().any():
+        fig.add_trace(go.Scatter(x=ohlc_day["time"], y=ohlc_day["MA3"], mode="lines",
+                                 line=dict(color="#d62728", width=1.8), name="MA3"))
+
+    COLOR_MAP = {"買建":"#ff69b4","売建":"#1f77b4","売埋":"#2ca02c","買埋":"#ff7f0e"}
+    SYMBOL_MAP = {"買建":"triangle-up","売建":"triangle-up","売埋":"triangle-down","買埋":"triangle-down"}
+    TEXT_POS   = {"買建":"top center","売建":"top center","売埋":"bottom center","買埋":"bottom center"}
+
+    for act, df_act in marker_groups.items():
+        fig.add_trace(go.Scatter(
+            x=df_act["exec_time"], y=df_act["price"],
+            mode="markers+text",
+            text=[act]*len(df_act),
+            textposition=TEXT_POS.get(act, "top center"),
+            marker_symbol=SYMBOL_MAP.get(act, "circle"),
+            marker_size=10,
+            marker_color=COLOR_MAP.get(act, "#444"),
+            name=act
         ))
 
-        # VWAP
-        if cols.vwap and cols.vwap in view.columns:
-            fig.add_trace(go.Scatter(x=x, y=view[cols.vwap], mode="lines", name="VWAP", opacity=0.85))
+    fig.update_layout(
+        title=f"{sel_date} - {disp_nm} ({code4}) 3分足",
+        height=MAIN_CHART_HEIGHT, xaxis_title="時刻", yaxis_title="価格",
+        xaxis_rangeslider_visible=False,
+        xaxis=dict(range=[start_dt, end_dt], tickformat="%H:%M")
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-        # 約定オーバーレイ（安全版）
-        overlay_ok = st.checkbox(
-            "約定履歴を重ねる（タブ②で読み込むと有効）",
-            value=True,
-            disabled=st.session_state["trades_df"] is None,
-        )
-        
-        if overlay_ok and st.session_state["trades_df"] is not None:
-            tdf = st.session_state["trades_df"].copy()
-        
-            # セッションから列名を取得（None 安全）
-            t_time_col  = st.session_state.get("trades_time_col")
-            t_price_col = st.session_state.get("trades_price_col")
-            t_side_norm = "SIDE_NORM" if "SIDE_NORM" in tdf.columns else None
-            t_inout_norm= st.session_state.get("trades_inout_col")
-        
-            # 列の存在チェック（無ければオーバーレイせず注意書き）
-            if not t_time_col or t_time_col not in tdf.columns:
-                st.caption("⚠ 約定の時刻列が見つからないため、オーバーレイをスキップしました。")
-            else:
-                # 価格列クレンジング（存在すれば）
-                if t_price_col and t_price_col in tdf.columns and not pd.api.types.is_numeric_dtype(tdf[t_price_col]):
-                    tdf[t_price_col] = clean_numeric_series(tdf[t_price_col])
-        
-                # 表示期間内に絞る（両者とも tz なしに統一して比較）
-                if isinstance(view.index, pd.DatetimeIndex):
-                    idx_naive = _drop_tz_index(view.index)
-                    t_series  = _drop_tz_series(tdf[t_time_col])
-                    if len(idx_naive) > 0:
-                        min_ts, max_ts = idx_naive.min(), idx_naive.max()
-                        mask = (t_series >= min_ts) & (t_series <= max_ts)
-                        tdf = tdf[mask]
-        
-                # 1) BUY/SELL があれば描画
-                if t_side_norm and t_side_norm in tdf.columns and t_price_col and t_price_col in tdf.columns:
-                    buys  = tdf[tdf[t_side_norm] == "BUY"]
-                    sells = tdf[tdf[t_side_norm] == "SELL"]
-                    if len(buys) > 0:
-                        fig.add_trace(go.Scatter(
-                            x=buys[t_time_col], y=buys[t_price_col], mode="markers",
-                            name="買", marker_symbol="triangle-up", marker_size=10, opacity=0.9,
-                        ))
-                    if len(sells) > 0:
-                        fig.add_trace(go.Scatter(
-                            x=sells[t_time_col], y=sells[t_price_col], mode="markers",
-                            name="売", marker_symbol="triangle-down", marker_size=10, opacity=0.9,
-                        ))
-        
-                # 2) IN/OUT があれば描画（SIDE が無くても表示）
-                if t_inout_norm and t_inout_norm in tdf.columns and t_price_col and t_price_col in tdf.columns:
-                    inns = tdf[tdf[t_inout_norm] == "IN"]
-                    outs = tdf[tdf[t_inout_norm] == "OUT"]
-                    if len(inns) > 0:
-                        fig.add_trace(go.Scatter(
-                            x=inns[t_time_col], y=inns[t_price_col], mode="markers",
-                            name="IN", marker_symbol="x", marker_size=9, opacity=0.9,
-                        ))
-                    if len(outs) > 0:
-                        fig.add_trace(go.Scatter(
-                            x=outs[t_time_col], y=outs[t_price_col], mode="markers",
-                            name="OUT", marker_symbol="diamond-open", marker_size=11, opacity=0.9,
-                        ))
-
-        st.plotly_chart(fig, use_container_width=True)
-
-# ---------- ② 約定履歴 ----------
-with tab2:
-    st.subheader("約定履歴（CSV/TSV/Excel）")
-    st.caption("想定列： 約定日/約定時間 / 売買 / 約定数 / 約定単価（列名は任意。下の候補で指定）")
-    trades_file = st.file_uploader("約定履歴ファイル", type=["csv", "txt", "xlsx"], key="trades_upl")
-
-    # 列候補（既定に「約定日」「約定単価(円)」なども含める）
-    t_time_c = st.text_input("（約定）時刻 列候補", value="約定日,約定時間,日時,日付,time,Time")
-    t_side_c = st.text_input("売買 列候補", value="売買,side,Side,区分,取引")
-    t_qty_c  = st.text_input("数量（約定数） 列候補", value="約定数,数量,株数,約定数量,Qty,qty,サイズ,約定数量(株/口)")
-    t_price_c= st.text_input("価格（約定単価） 列候補", value="約定単価,約定単価(円),単価,価格,Price,price")
-    t_inout_c= st.text_input("IN/OUT 列候補（新規/返済・エントリー/決済 等）",
-                             value="IN/OUT,INOUT,新規返済,新規/返済,entry_exit,EntryExit,区分2,取引種別")
-
-    if trades_file is None:
-        st.info("📄 ファイルを選ぶとタブ①に“買/売/IN/OUTマーカー”を重ねられます。")
-    else:
-        try:
-            df_tr = load_any_table(trades_file.name, trades_file.getvalue(), encoding, decimal, thousands)
-        except Exception as e:
-            st.error("読み込みに失敗しました。")
-            st.exception(e)
-            st.stop()
-
-        used_enc = df_tr.attrs.get("used_encoding")
-        used_sep = df_tr.attrs.get("used_sep")
-        if used_enc or used_sep:
-            st.caption(f"🔎 encoding={used_enc or 'Excel'}, sep={used_sep or '(Excel)'}")
-
-        # ---- 列検出（依存関数なしの安全版）----
-        def pick_col(df: pd.DataFrame, cand_str: str) -> Optional[str]:
-            cands = [s.strip() for s in str(cand_str).split(",") if s.strip()]
-            for c in cands:
-                if c in df.columns:
-                    return c
-            return None
-
-        t_time  = pick_col(df_tr, t_time_c)
-        t_side  = pick_col(df_tr, t_side_c)
-        t_qty   = pick_col(df_tr, t_qty_c)
-        t_price = pick_col(df_tr, t_price_c)
-        t_inout = pick_col(df_tr, t_inout_c)
-
-        # 型変換
-        if t_time:
-            df_tr[t_time] = pd.to_datetime(df_tr[t_time], errors="coerce")
-            df_tr[t_time] = _drop_tz_series(df_tr[t_time])   # ← 追加：tz を外す
-
-        for col in [t_qty, t_price]:
-            if col and col in df_tr.columns:
-                df_tr[col] = clean_numeric_series(df_tr[col])
-
-        # 正規化カラムを追加（IN/OUT列が無くても 売買 から導出）
-        if t_side and t_side in df_tr.columns:
-            df_tr["SIDE_NORM"] = df_tr[t_side].apply(normalize_side)
-
-        if t_inout and t_inout in df_tr.columns:
-            df_tr["INOUT_NORM"] = df_tr[t_inout].apply(normalize_inout)
-        elif t_side and t_side in df_tr.columns:
-            df_tr["INOUT_NORM"] = df_tr[t_side].apply(normalize_inout)
-
-        st.write("#### プレビュー")
-        st.dataframe(df_tr.head(200))
-
-        with st.expander("検出状況（デバッグ）"):
-            st.write({
-                "time_col": t_time, "price_col": t_price, "side_col": t_side, "inout_col": t_inout
-            })
-            if "SIDE_NORM" in df_tr.columns:
-                st.write("SIDE_NORM counts:", df_tr["SIDE_NORM"].value_counts(dropna=False))
-            if "INOUT_NORM" in df_tr.columns:
-                st.write("INOUT_NORM counts:", df_tr["INOUT_NORM"].value_counts(dropna=False))
-
-        with st.expander("簡易サマリ"):
-            total_rows = len(df_tr)
-            buy_n = int(df_tr["SIDE_NORM"].eq("BUY").sum()) if "SIDE_NORM" in df_tr.columns else 0
-            sell_n = int(df_tr["SIDE_NORM"].eq("SELL").sum()) if "SIDE_NORM" in df_tr.columns else 0
-            st.write(f"- 行数: {total_rows} / 買: {buy_n} / 売: {sell_n}")
-            if t_qty:
-                st.write(f"- 総数量: {pd.to_numeric(df_tr[t_qty], errors='coerce').sum():,.0f}")
-            if t_price:
-                st.write(f"- 価格（約定単価）min/median/max: {df_tr[t_price].min()} / {df_tr[t_price].median()} / {df_tr[t_price].max()}")
-
-        # タブ①で使うためセッション保存
-        st.session_state["trades_df"] = df_tr
-        st.session_state["trades_time_col"] = t_time
-        st.session_state["trades_price_col"] = t_price
-        st.session_state["trades_side_col"] = t_side
-        st.session_state["trades_inout_col"] = "INOUT_NORM" if "INOUT_NORM" in df_tr.columns else None
-
-# ---------- ③ 実現損益 ----------
-with tab3:
-    st.subheader("実現損益（CSV/TSV/Excel）")
-    st.caption("想定列： 日付 / 実現損益（列名自由、下の候補で指定）")
-    pnl_file = st.file_uploader("実現損益ファイル", type=["csv", "txt", "xlsx"], key="pnl_upl")
-    d_col_cand = st.text_input("日付 列候補", value="日付,日時,Date,date")
-    pnl_col_cand = st.text_input("損益 列候補", value="実現損益,損益,PnL,Profit,profit")
-
-    if pnl_file is None:
-        st.info("📄 ファイルを選ぶと推移と累積を描画します。")
-    else:
-        try:
-            df_pnl = load_any_table(pnl_file.name, pnl_file.getvalue(), encoding, decimal, thousands)
-        except Exception as e:
-            st.error("読み込みに失敗しました。")
-            st.exception(e)
-            st.stop()
-
-        used_enc = df_pnl.attrs.get("used_encoding")
-        used_sep = df_pnl.attrs.get("used_sep")
-        if used_enc or used_sep:
-            st.caption(f"🔎 encoding={used_enc or 'Excel'}, sep={used_sep or '(Excel)'}")
-
-        d_col = _find_first(df_pnl, _split_candidates(d_col_cand))
-
-        # 列候補から見つからない場合に備えて、ゆるめ検出
-        p_col = _find_first(df_pnl, _split_candidates(pnl_col_cand))
-        if p_col is None:
-            tokens = ["損", "益", "損益", "実現", "pl", "p/l", "profit", "pnl", "realized"]
-            cand_names = [c for c in df_pnl.columns if any(t in str(c).lower() for t in tokens)]
-            best_col, best_ratio = None, 0.0
-            for c in cand_names:
-                ser = clean_numeric_series(df_pnl[c])
-                ratio = ser.notna().mean()
-                if ratio > best_ratio:
-                    best_ratio, best_col = ratio, c
-            if best_col is not None and best_ratio >= 0.5:
-                p_col = best_col
-
-        if d_col:
-            df_pnl[d_col] = pd.to_datetime(df_pnl[d_col], errors="coerce")
-            df_pnl = df_pnl.sort_values(d_col).set_index(d_col)
-
-        if p_col is None:
-            st.error("損益列が見つかりません。列候補に実際の列名を追記してください。")
-        else:
-            # 通貨記号・カンマ・括弧・全角マイナスなどを吸収
-            df_pnl[p_col] = clean_numeric_series(df_pnl[p_col])
-
-            st.write("#### プレビュー")
-            st.dataframe(df_pnl[[p_col]].head(500))
-
-            st.write("#### 日次（または時系列）推移")
-            st.line_chart(df_pnl[[p_col]], height=300)
-
-            st.write("#### 累積損益")
-            cum = df_pnl[[p_col]].cumsum().rename(columns={p_col: "累積"})
-            st.line_chart(cum, height=300)
+    if skipped_price>0:
+        st.warning(f"価格を補完できずマーカーを表示できなかった約定: {skipped_price} 件（±6分に足が無い 等）")
