@@ -45,6 +45,33 @@ with st.sidebar:
     vwap_col = st.text_input("VWAP 列候補", value="VWAP,vwap")
 
 # ================= ユーティリティ =================
+def _drop_tz_index(idx):
+    """DatetimeIndex の tz を外して naive に統一"""
+    if isinstance(idx, pd.DatetimeIndex):
+        try:
+            return idx.tz_localize(None)
+        except Exception:
+            try:
+                return idx.tz_convert(None)
+            except Exception:
+                return idx
+    return idx
+
+def _drop_tz_series(s: pd.Series) -> pd.Series:
+    """Series[datetime] の tz を外して naive に統一"""
+    if not isinstance(s, pd.Series):
+        return s
+    # 一度 datetime 型へ
+    s = pd.to_datetime(s, errors="coerce")
+    # tz を外す
+    try:
+        return s.dt.tz_localize(None)
+    except Exception:
+        try:
+            return s.dt.tz_convert(None)
+        except Exception:
+            return s
+
 def _split_candidates(s: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
@@ -128,14 +155,16 @@ def parse_datetime_index(df: pd.DataFrame, time_cols: List[str]) -> Tuple[pd.Dat
     col = _find_first(df, time_cols)
     if col is None:
         return df, None
-    s = pd.to_datetime(df[col], errors="coerce")
+    s = _drop_tz_series(df[col])                 # ← tz を除去してから
     df[col] = s
     df = df.sort_values(col)
     try:
         df = df.set_index(col)
+        df.index = _drop_tz_index(df.index)      # ← 念のため index 側も tz 除去
     except Exception:
         pass
     return df, col
+
 
 @dataclass
 class OHLCCols:
@@ -292,9 +321,13 @@ with tab1:
             t_side_norm = "SIDE_NORM" if "SIDE_NORM" in tdf.columns else None
             t_inout_norm = st.session_state.get("trades_inout_col")
 
-            # 表示期間内に絞る
-            if isinstance(view.index, pd.DatetimeIndex) and t_time:
-                tdf = tdf[(tdf[t_time] >= view.index.min()) & (tdf[t_time] <= view.index.max())]
+            # 表示期間内に絞る（両者とも tz なしに統一して比較）
+        if isinstance(view.index, pd.DatetimeIndex) and t_time:
+            idx_naive = _drop_tz_index(view.index)
+            t_series  = _drop_tz_series(tdf[t_time])
+            min_ts, max_ts = idx_naive.min(), idx_naive.max()
+            tdf = tdf[(t_series >= min_ts) & (t_series <= max_ts)]
+
 
             # 価格列クレンジング（念のため）
             if t_price and t_price in tdf.columns and not pd.api.types.is_numeric_dtype(tdf[t_price]):
@@ -379,6 +412,8 @@ with tab2:
         # 型変換
         if t_time:
             df_tr[t_time] = pd.to_datetime(df_tr[t_time], errors="coerce")
+            df_tr[t_time] = _drop_tz_series(df_tr[t_time])   # ← 追加：tz を外す
+
         for col in [t_qty, t_price]:
             if col and col in df_tr.columns:
                 df_tr[col] = clean_numeric_series(df_tr[col])
