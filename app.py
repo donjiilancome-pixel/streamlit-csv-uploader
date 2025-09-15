@@ -2,7 +2,7 @@
 import io, re, hashlib
 from io import StringIO
 from collections import Counter
-from datetime import date, timedelta
+from datetime import date, timedelta, time, datetime
 
 import numpy as np
 import pandas as pd
@@ -18,8 +18,14 @@ st.title("📈 デイトレ結果ダッシュボード（VWAP/MA対応・3分足
 st.caption("複数ファイルアップロード対応・3分足: Asia/Tokyo / 9:00–15:30・信用区分フィルタ（全体/一般=デイ/制度=スイング）")
 
 TZ = ZoneInfo("Asia/Tokyo")
-MAIN_CHART_HEIGHT = 600
-LARGE_CHART_HEIGHT = 860
+MAIN_CHART_HEIGHT = 600   # 標準の高さ
+LARGE_CHART_HEIGHT = 860  # 拡大表示時の高さ
+
+# 時間帯（前場/後場）
+MORNING_START = time(9,0)
+MORNING_END   = time(11,30)
+AFTERNOON_START = time(12,30)
+AFTERNOON_END   = time(15,30)
 
 # =========================================================
 # ユーティリティ
@@ -34,7 +40,7 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns={c:_clean_colname(c) for c in df.columns})
 
 def to_numeric_jp(x):
-    """日本語CSVでよくある表記を数値化"""
+    """日本語CSVでよくある表記を数値化。 (123)→-123, 全角マイナス, 桁区切り, 円/株/％など除去"""
     if isinstance(x, pd.Series):
         s = (x.astype(str)
                .str.replace(r"\((\s*[\d,\.]+)\)", r"-\1", regex=True)
@@ -93,6 +99,7 @@ def read_table_from_upload(file_name: str, file_bytes: bytes) -> pd.DataFrame:
             return pd.DataFrame()
 
 def files_signature(files) -> str:
+    """アップロード複数ファイルのキャッシュキー生成"""
     if not files: return ""
     parts = []
     for f in files:
@@ -170,7 +177,7 @@ def build_code_to_name_map(*dfs: pd.DataFrame) -> dict:
     return mp
 
 # =========================================================
-# 日付/時刻列の検出
+# 実現損益・約定の正規化
 # =========================================================
 def pick_dt_col(df: pd.DataFrame, preferred=None) -> str | None:
     if df is None or df.empty: return None
@@ -190,13 +197,13 @@ def pick_time_col(df: pd.DataFrame, preferred=None) -> str | None:
         if re.search(r"(約定)?(時刻|時間)", str(c)): return c
     return None
 
-def _row_has_explicit_time(row_val: str) -> bool:
-    if row_val is None: return False
-    s = str(row_val).strip()
-    if re.search(r"\d{1,2}:\d{1,2}(:\d{1,2})?", s): return True
-    if re.search(r"\d{3,6}$", s): return True
-    if re.search(r"\d{1,2}時\d{1,2}分", s): return True
-    return False
+def _contains_time_string(s: pd.Series) -> pd.Series:
+    """列文字列に時刻表現が含まれるか（hh:mm, 数値hhmmss, '時分' など）"""
+    ss = s.astype(str)
+    has_hms = ss.str.contains(r"\d{1,2}[:：]\d{1,2}")
+    has_num = ss.str.contains(r"\b\d{3,6}\b")
+    has_jp  = ss.str.contains(r"\d{1,2}時\d{1,2}分")
+    return has_hms | has_num | has_jp
 
 def parse_time_only_to_timedelta(s: pd.Series) -> pd.Series:
     ss = s.astype(str).str.strip().str.replace("：",":", regex=False)
@@ -257,29 +264,27 @@ def parse_datetime_from_dtcol(df: pd.DataFrame, dtcol: str) -> pd.Series:
         ts = ts.dt.tz_convert(TZ)
     return ts
 
-# =========================================================
-# 実現損益・約定の正規化
-# =========================================================
 def normalize_realized(df: pd.DataFrame) -> pd.DataFrame:
     """
-    列名ゆる検出＋数値化。'約定日時'・'約定日'・'実現損益[円]' を作成。
-    '__has_time__' で「時刻が明示されている行」を保持（時間別集計で使用）。
+    列名ゆる検出＋数値化。'約定日時' と '約定日'（date）と '実現損益[円]' を作る。
+    さらに '約定時刻あり'(bool) を付与し、時刻情報を持たない行を識別できるようにする。
     """
     if df is None or df.empty:
         return df
     d = clean_columns(df.copy())
 
+    # 日付・時刻列の検出
     date_col = pick_dt_col(d)
     time_col = pick_time_col(d)
 
-    # 時刻が明示されているかを行単位で推定
-    has_time = pd.Series(False, index=d.index)
+    # 時刻有無の判定（元データの列を参照）
+    has_time_flag = pd.Series(False, index=d.index)
     if time_col:
-        has_time = has_time | d[time_col].astype(str).map(_row_has_explicit_time)
+        has_time_flag |= d[time_col].notna() & d[time_col].astype(str).str.strip().ne("")
     if date_col:
-        has_time = has_time | d[date_col].astype(str).map(_row_has_explicit_time)
+        has_time_flag |= _contains_time_string(d[date_col])
 
-    # 約定日時
+    # 約定日時（可能なら結合／なければ単一列から）
     if date_col and time_col:
         d["約定日時"] = combine_date_time_cols(d, date_col, time_col)
     elif date_col:
@@ -292,9 +297,10 @@ def normalize_realized(df: pd.DataFrame) -> pd.DataFrame:
     else:
         d["約定日時"] = pd.NaT
 
+    # 約定日（date のみ）
     d["約定日"] = pd.to_datetime(d["約定日時"], errors="coerce").dt.date
 
-    # 実現損益列の正規化
+    # 実現損益列を検出 → "実現損益[円]" に正規化
     pl_col = None
     for c in ["実現損益[円]","実現損益（円）","実現損益","損益[円]","損益額","損益"]:
         if c in d.columns:
@@ -314,8 +320,9 @@ def normalize_realized(df: pd.DataFrame) -> pd.DataFrame:
     else:
         d["実現損益[円]"] = pd.Series(dtype="float64")
 
-    d["__has_time__"] = has_time
-    return normalize_symbol_cols(d)
+    d = normalize_symbol_cols(d)
+    d["約定時刻あり"] = has_time_flag.fillna(False)
+    return d
 
 def normalize_yakujyou(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return df
@@ -356,26 +363,21 @@ def side_to_action(val: str) -> str | None:
     if "buy" in s and "close" in s:      return "買埋"
     return None
 
-# ---- 約定（約定履歴）→ IN/OUT マーカー生成（チャート用）
-def pick_dt_col_yj(df: pd.DataFrame) -> str | None:
-    return pick_dt_col(df)
-
-def pick_time_col_yj(df: pd.DataFrame) -> str | None:
-    return pick_time_col(df)
-
+# ---- 約定（約定履歴）→ IN/OUT マーカー生成の補助
 def build_exec_table_allperiod(yj_all: pd.DataFrame) -> pd.DataFrame:
     if yj_all is None or yj_all.empty:
         return pd.DataFrame(columns=["code_key","name_key","exec_time","price","io","action"])
     d = yj_all.copy()
 
-    dtcol = pick_dt_col_yj(d); tmcol = pick_time_col_yj(d)
+    dtcol = pick_dt_col(d); tmcol = pick_time_col(d)
     if dtcol is None:
         return pd.DataFrame(columns=["code_key","name_key","exec_time","price","io","action"])
 
     def has_time_rowwise(row):
         val_dt = str(row.get(dtcol, "")).strip()
         val_tm = str(row.get(tmcol, "")).strip() if tmcol else ""
-        if val_tm: return True
+        if val_tm:
+            return True
         if re.search(r"[:：]", val_dt): return True
         if re.search(r"\b\d{3,6}\b", val_dt): return True
         if re.search(r"時\d{1,2}分", val_dt): return True
@@ -430,8 +432,8 @@ def build_trade_table_for_display(yakujyou_all: pd.DataFrame, sel_date: date, co
         return pd.DataFrame(columns=["約定時間","売買","約定数","約定単価"])
 
     d = normalize_symbol_cols(yakujyou_all.copy())
-    dtcol = pick_dt_col_yj(d)
-    tmcol = pick_time_col_yj(d)
+    dtcol = pick_dt_col(d)
+    tmcol = pick_time_col(d)
     if dtcol is None:
         return pd.DataFrame(columns=["約定時間","売買","約定数","約定単価"])
 
@@ -447,7 +449,6 @@ def build_trade_table_for_display(yakujyou_all: pd.DataFrame, sel_date: date, co
     if d.empty:
         return pd.DataFrame(columns=["約定時間","売買","約定数","約定単価"])
 
-    # 売買
     side_col = None
     for c in ["売買","売買区分","売買種別","Side","取引"]:
         if c in d.columns: side_col = c; break
@@ -457,7 +458,17 @@ def build_trade_table_for_display(yakujyou_all: pd.DataFrame, sel_date: date, co
                 side_col = c; break
 
     def _side_to_action(val: str) -> str | None:
-        return side_to_action(val)
+        if val is None or (isinstance(val, float) and np.isnan(val)): return None
+        s = str(val).replace("　","").replace(" ","").lower()
+        if "買建" in s: return "買建"
+        if "売建" in s: return "売建"
+        if ("売埋" in s) or ("売返済" in s): return "売埋"
+        if ("買埋" in s) or ("買返済" in s): return "買埋"
+        if "buy" in s and "close" not in s:  return "買建"
+        if "sell" in s and "close" not in s: return "売建"
+        if "sell" in s and "close" in s:     return "売埋"
+        if "buy" in s and "close" in s:      return "買埋"
+        return None
 
     if side_col:
         side_series = d[side_col].astype(str)
@@ -466,7 +477,6 @@ def build_trade_table_for_display(yakujyou_all: pd.DataFrame, sel_date: date, co
     else:
         side_series = d.get("action", None)
 
-    # 数量/価格
     def select_qty_series(df: pd.DataFrame) -> pd.Series | None:
         cand_exact = [
             "約定数量", "約定数量(株)", "約定数量（株）", "約定株数",
@@ -480,8 +490,10 @@ def build_trade_table_for_display(yakujyou_all: pd.DataFrame, sel_date: date, co
         for c in df.columns:
             cname = str(c).replace(" ", "")
             if any(k in cname for k in ["数量", "株数", "口数", "出来高"]):
-                s = to_numeric_jp(df[c]); k = s.notna().sum()
-                if k > nn: best, nn = c, k
+                s = to_numeric_jp(df[c])
+                k = s.notna().sum()
+                if k > nn:
+                    best, nn = c, k
         return to_numeric_jp(df[best]) if best else None
 
     def select_price_series(df: pd.DataFrame) -> pd.Series | None:
@@ -514,7 +526,8 @@ def build_trade_table_for_display(yakujyou_all: pd.DataFrame, sel_date: date, co
 @st.cache_data(show_spinner=False)
 def load_ohlc_map_from_uploads(files, sig: str):
     """
-    time, open, high, low, close を必須。任意で VWAP, MA1, MA2, MA3。
+    time, open, high, low, close を必須とし、任意で VWAP, MA1, MA2, MA3 を取り込む。
+    キーはアップロード時のファイル名（拡張子除く）。
     """
     ohlc_map = {}
     if not files: return ohlc_map
@@ -545,7 +558,8 @@ def load_ohlc_map_from_uploads(files, sig: str):
         t = pd.to_datetime(df["time"], errors="coerce", infer_datetime_format=True)
         if getattr(t.dtype, "tz", None) is None: t = t.dt.tz_localize(TZ)
         else: t = t.dt.tz_convert(TZ)
-        df = df.copy(); df["time"] = t
+        df = df.copy()
+        df["time"] = t
 
         def pick_one(df, names):
             for n in names:
@@ -597,51 +611,6 @@ def ohlc_global_date_range(ohlc_map: dict):
 def market_time(sel_date: date, start_str="09:00", end_str="15:30"):
     return pd.Timestamp(f"{sel_date} {start_str}", tz=TZ), pd.Timestamp(f"{sel_date} {end_str}", tz=TZ)
 
-def slice_window_with_fallback(df: pd.DataFrame, sel_date: date) -> tuple[pd.DataFrame, str]:
-    note = ""
-    if df.empty or "time" not in df.columns:
-        return df.head(0), "該当日のデータが見つかりませんでした。"
-
-    t = df["time"]
-    if getattr(t.dtype,"tz",None) is None:
-        t_local = pd.to_datetime(t, errors="coerce").dt.tz_localize(TZ)
-    else:
-        t_local = pd.to_datetime(t, errors="coerce").dt.tz_convert(TZ)
-    base = df.copy(); base["time"] = t_local
-
-    s,e = market_time(sel_date, "09:00", "15:30")
-    out = base.loc[(base["time"]>=s)&(base["time"]<=e)]
-    if not out.empty:
-        return out.copy(), note
-
-    if getattr(t.dtype,"tz",None) is None:
-        t_utc = pd.to_datetime(t, errors="coerce").dt.tz_localize("UTC").dt.tz_convert(TZ)
-        base2 = df.copy(); base2["time"] = t_utc
-        out2 = base2.loc[(base2["time"]>=s)&(base2["time"]<=e)]
-        if not out2.empty:
-            return out2.copy(), "指数/先物CSVの time を UTC として再解釈しました。"
-
-    s2,e2 = market_time(sel_date, "08:45", "15:30")
-    out = base.loc[(base["time"]>=s2)&(base["time"]<=e2)]
-    if not out.empty:
-        return out.copy(), "8:45–15:30 に拡大して抽出しました。"
-
-    out = base.loc[base["time"].dt.date == sel_date]
-    if not out.empty:
-        return out.copy(), "当日の終日データで表示しました。"
-
-    df_dates = base["time"].dt.date
-    if df_dates.empty:
-        return base.head(0), "該当日の近傍にもデータが見つかりませんでした。"
-    diffs = (pd.to_datetime(df_dates) - pd.Timestamp(sel_date)).abs()
-    idx = diffs.values.argmin()
-    nearest_day = df_dates.iloc[idx]
-    out = base.loc[df_dates==nearest_day]
-    if not out.empty:
-        return out.copy(), f"{sel_date} にデータが無いため {nearest_day} のデータを表示しています。"
-
-    return base.head(0), "該当日のデータが見つかりませんでした。"
-
 def pick_best_ohlc_key_for_date(code4: str, ohlc_code_index: dict, ohlc_map: dict, sel_date) -> tuple[str|None, pd.DataFrame|None, str]:
     keys = ohlc_code_index.get(str(code4).upper(), [])
     if not keys: return None, None, "該当キーなし"
@@ -688,39 +657,6 @@ def compute_max_drawdown(series: pd.Series) -> float:
         max_dd = max(max_dd, peak - x)
     return float(max_dd)
 
-def find_first_key_by_prefix(ohlc_map: dict, prefix: str, sel_date: date | None = None) -> str | None:
-    if not ohlc_map: return None
-    pfx = prefix.lower()
-    cands = [k for k in ohlc_map.keys() if k.lower().startswith(pfx)]
-    if not cands: return None
-
-    def norm_t(s: pd.Series):
-        return s.dt.tz_localize(TZ) if getattr(s.dtype,"tz",None) is None else s.dt.tz_convert(TZ)
-
-    if sel_date is None:
-        best = max(cands, key=lambda k: norm_t(ohlc_map[k]["time"]).max())
-        return best
-
-    s_dt, e_dt = market_time(sel_date)
-    def score(k):
-        t = norm_t(ohlc_map[k]["time"])
-        if t.empty:
-            return (3, float("inf"), float("-inf"))
-        in_win   = ((t>=s_dt)&(t<=e_dt)).any()
-        same_day = (t.dt.date==sel_date).any()
-        sel_ts   = pd.Timestamp(sel_date, tz=TZ)
-        tmin, tmax = t.min(), t.max()
-        if tmax < sel_ts:
-            dd = (sel_ts - tmax).total_seconds()
-        elif tmin > sel_ts:
-            dd = (tmin - sel_ts).total_seconds()
-        else:
-            dd = 0.0
-        return (0 if in_win else (1 if same_day else 2), dd, -tmax.value)
-
-    cands.sort(key=score)
-    return cands[0]
-
 # ======== タイムフレーム検出＆リサンプリング ========
 def _detect_base_interval_minutes(ts: pd.Series) -> int | None:
     if ts is None or ts.empty: return None
@@ -763,6 +699,29 @@ def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 
     out = out.reset_index()
     return out
+
+# ======== 時間系ヘルパ ========
+BASE_ANCHOR_DATE = datetime(2000,1,1, tzinfo=TZ)
+
+def to_time_of_day_ts(dt_series: pd.Series) -> pd.Series:
+    """時刻だけを 2000-01-01 上の Timestamp に乗せる（x軸用）"""
+    dt_local = dt_series.dt.tz_convert(TZ)
+    return pd.to_datetime([datetime(2000,1,1,h, m, s, tzinfo=TZ)
+                           for h,m,s in zip(dt_local.dt.hour, dt_local.dt.minute, dt_local.dt.second)])
+
+def session_of(dt_series: pd.Series) -> pd.Series:
+    """前場/後場/その他（Na）を判定"""
+    t = dt_series.dt.tz_convert(TZ).dt.time
+    cond_m = (t >= MORNING_START) & (t <= MORNING_END)
+    cond_a = (t >= AFTERNOON_START) & (t <= AFTERNOON_END)
+    out = pd.Series(pd.NA, index=dt_series.index, dtype="object")
+    out[cond_m] = "前場"; out[cond_a] = "後場"
+    return out
+
+def clip_market_time(dt_series: pd.Series) -> pd.Series:
+    """9:00～15:30 に入っている行だけ True"""
+    tl = dt_series.dt.tz_convert(TZ).dt.time
+    return (tl >= MORNING_START) & (tl <= AFTERNOON_END)
 
 # =========================================================
 # サイドバー：データアップロード & フィルタ
@@ -832,4 +791,677 @@ realized_f = apply_trade_type_filter(filter_by_span(realized, "約定日"))
 # =========================================================
 st.subheader("KPI")
 
-if not realized_f.empty and "実現損益[円
+if not realized_f.empty and "実現損益[円]" in realized_f.columns:
+    realized_f["実現損益[円]"] = to_numeric_jp(realized_f["実現損益[円]"])
+
+pl = None
+if not realized_f.empty and "実現損益[円]" in realized_f.columns:
+    pl = to_numeric_jp(realized_f["実現損益[円]"]).dropna()
+
+c1,c2,c3 = st.columns(3)
+with c1:
+    total_pl = pl.sum() if pl is not None and not pl.empty else np.nan
+    st.metric("実現損益（選択期間）", f"{int(total_pl):,} 円" if pd.notna(total_pl) else "—")
+with c2:
+    n_trades = int(pl.shape[0]) if pl is not None else 0
+    st.metric("取引回数", f"{n_trades:,}" if n_trades else "—")
+with c3:
+    avg_pl = pl.mean() if pl is not None and not pl.empty else np.nan
+    st.metric("平均損益（/回）", f"{int(round(avg_pl)):,} 円" if pd.notna(avg_pl) else "—")
+
+c4,c5,c6 = st.columns(3)
+with c4:
+    win_rate = (pl>0).mean()*100 if pl is not None and not pl.empty else np.nan
+    st.metric("勝率（全体）", f"{win_rate:.1f}%" if pd.notna(win_rate) else "—")
+
+wr_long = wr_short = np.nan
+if not realized_f.empty and ("取引" in realized_f.columns):
+    rj = realized_f.copy()
+    rj["PL"] = to_numeric_jp(rj["実現損益[円]"])
+    rj["LR"] = rj["取引"].map(lr_from_realized_trade)
+    pl_long  = rj.loc[rj["LR"]=="LONG","PL"]
+    pl_short = rj.loc[rj["LR"]=="SHORT","PL"]
+    wr_long  = (pl_long>0).mean()*100  if pl_long.notna().any()  else np.nan
+    wr_short = (pl_short>0).mean()*100 if pl_short.notna().any() else np.nan
+
+with c5: st.metric("勝率（ロング）", f"{wr_long:.1f}%" if pd.notna(wr_long) else "—")
+with c6: st.metric("勝率（ショート）", f"{wr_short:.1f}%" if pd.notna(wr_short) else "—")
+
+# 最大DD
+c7,_c8,_c9 = st.columns(3)
+with c7:
+    if not realized_f.empty and "約定日" in realized_f.columns and "実現損益[円]" in realized_f.columns:
+        tmp = realized_f.copy()
+        tmp["日"] = pd.to_datetime(tmp["約定日"], errors="coerce").dt.date
+        tmp["実現損益[円]"] = to_numeric_jp(tmp["実現損益[円]"])
+        seq = tmp.groupby("日", as_index=False)["実現損益[円]"].sum().sort_values("日")
+        seq["累計"] = pd.to_numeric(seq["実現損益[円]"], errors="coerce").cumsum()
+        dd = compute_max_drawdown(seq["累計"])
+        st.metric("最大ドローダウン", f"{int(round(dd)):,} 円" if pd.notna(dd) else "—")
+    else:
+        st.metric("最大ドローダウン", "—")
+
+# =========================================================
+# タブ
+# =========================================================
+tab1, tab1b, tab2, tab3, tab4, tab5 = st.tabs([
+    "集計（期間別）",
+    "集計（時間別）",
+    "累計損益",
+    "個別銘柄",
+    "ランキング",
+    "3分足 IN/OUT + 指標"
+])
+
+# ---- 1) 期間別
+with tab1:
+    st.markdown("### 実現損益（期間別集計）")
+    if realized_f.empty:
+        st.info("実現損益データが必要です。")
+    else:
+        r = realized_f.copy()
+        dts = pd.to_datetime(r["約定日"], errors="coerce")
+        r["実現損益[円]"] = to_numeric_jp(r["実現損益[円]"])
+        r["日"] = dts.dt.date
+        r["週"] = (dts - pd.to_timedelta(dts.dt.weekday, unit="D")).dt.date
+        r["月"] = dts.dt.to_period("M").dt.to_timestamp().dt.date
+        r["年"] = dts.dt.to_period("Y").dt.to_timestamp().dt.date
+        for label,col in [("日別","日"),("週別","週"),("月別","月"),("年別","年")]:
+            g = r.groupby(col, as_index=False)["実現損益[円]"].sum().sort_values(col)
+            st.write(f"**{label}**")
+            st.dataframe(g, use_container_width=True, hide_index=True)
+            download_button_df(g, f"⬇ CSVダウンロード（{label}）", f"{col}_pl.csv")
+            fig_bar = go.Figure([go.Bar(x=g[col], y=g["実現損益[円]"], name=f"{label} 実現損益")])
+            fig_bar.update_layout(margin=dict(l=10,r=10,t=20,b=10), height=300, xaxis_title=label, yaxis_title="実現損益[円]")
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+# ---- 1b) 時間別（修正：時刻ありのみ、x軸9:00-15:30、前場/後場比較・累積勝率）
+with tab1b:
+    st.markdown("### 実現損益（時間別・1時間ごと）")
+    if realized_f.empty:
+        st.info("実現損益データが必要です。")
+    else:
+        d = realized_f.copy()
+
+        # 1) 時刻がある行のみ採用（ご要望）
+        if "約定日時" in d.columns:
+            dt = pd.to_datetime(d["約定日時"], errors="coerce")
+        else:
+            dt = pd.to_datetime(d["約定日"], errors="coerce")
+        try:
+            dt = dt.dt.tz_convert(TZ)
+        except Exception:
+            dt = dt.dt.tz_localize(TZ)
+
+        # 正しく「時刻を持っている」行のみ（normalize_realized で付与したフラグを優先）
+        has_time = d["約定時刻あり"] if "約定時刻あり" in d.columns else dt.dt.strftime("%H:%M:%S").ne("00:00:00")
+        d = d.loc[has_time].copy()
+
+        # 2) 市場時間 9:00～15:30 でフィルタ
+        mask_mkt = clip_market_time(dt.loc[d.index])
+        d = d.loc[mask_mkt].copy()
+        dt = dt.loc[d.index]  # 揃える
+
+        # 指標列
+        d["PL"]   = to_numeric_jp(d["実現損益[円]"])
+        d["win"]  = d["PL"] > 0
+        if "取引" in d.columns:
+            d["LR"] = d["取引"].map(lr_from_realized_trade)
+        else:
+            d["LR"] = pd.NA
+
+        # 3) 時間別（1時間ごと）
+        hour_floor = dt.dt.floor("H")
+        # x軸を 2000-01-01 の擬似時刻に揃える
+        hour_x = pd.to_datetime([datetime(2000,1,1,h.hour,0,0, tzinfo=TZ) for h in hour_floor])
+        d["hour_x"] = hour_x
+
+        # 9:00～15:30 のタイル作成（x軸範囲固定）
+        x_ticks = pd.date_range(BASE_ANCHOR_DATE.replace(hour=9,minute=0),
+                                BASE_ANCHOR_DATE.replace(hour=15,minute=30),
+                                freq="60min", inclusive="both")
+        base = pd.DataFrame({"hour_x": x_ticks})
+
+        by = d.groupby("hour_x", as_index=False).agg(
+            収支=("PL","sum"),
+            取引回数=("PL","count"),
+            勝率=("win","mean"),
+            平均損益=("PL","mean")
+        )
+        # ロング/ショート勝率
+        if d["LR"].notna().any():
+            gL = d[d["LR"]=="LONG"].groupby("hour_x")["win"].mean().rename("勝率_ロング")
+            gS = d[d["LR"]=="SHORT"].groupby("hour_x")["win"].mean().rename("勝率_ショート")
+            by = base.merge(by, on="hour_x", how="left").merge(gL, on="hour_x", how="left").merge(gS, on="hour_x", how="left")
+        else:
+            by = base.merge(by, on="hour_x", how="left")
+            by["勝率_ロング"] = np.nan
+            by["勝率_ショート"] = np.nan
+
+        # 表
+        disp = by.copy()
+        disp["時間"] = disp["hour_x"].dt.strftime("%H:%M")
+        disp["勝率"] = (disp["勝率"]*100).round(1)
+        disp["勝率_ロング"] = (disp["勝率_ロング"]*100).round(1)
+        disp["勝率_ショート"] = (disp["勝率_ショート"]*100).round(1)
+        st.dataframe(disp[["時間","収支","取引回数","勝率","勝率_ロング","勝率_ショート","平均損益"]],
+                     use_container_width=True, hide_index=True)
+        download_button_df(disp, "⬇ CSVダウンロード（時間別）", "hourly_stats.csv")
+
+        # グラフ共通レイアウト
+        x_range = [BASE_ANCHOR_DATE.replace(hour=9,minute=0),
+                   BASE_ANCHOR_DATE.replace(hour=15,minute=30)]
+
+        # 収支
+        fig_h_pl = go.Figure([go.Bar(x=by["hour_x"], y=by["収支"], name="収支（合計）")])
+        fig_h_pl.update_layout(title="時間別 収支（合計）", xaxis_title="時間", yaxis_title="円",
+                               margin=dict(l=10,r=10,t=30,b=10), height=300,
+                               xaxis=dict(tickformat="%H:%M", range=x_range))
+        st.plotly_chart(fig_h_pl, use_container_width=True)
+
+        # 勝率（全体）
+        fig_h_wr = go.Figure([go.Scatter(x=by["hour_x"], y=by["勝率"]*100, mode="lines+markers", name="勝率")])
+        fig_h_wr.update_layout(title="時間別 勝率（全体）", xaxis_title="時間", yaxis_title="勝率（%）",
+                               margin=dict(l=10,r=10,t=30,b=10), height=300,
+                               yaxis=dict(range=[0,100]),
+                               xaxis=dict(tickformat="%H:%M", range=x_range))
+        st.plotly_chart(fig_h_wr, use_container_width=True)
+
+        # 勝率（ロング/ショート）
+        fig_h_lr = go.Figure()
+        fig_h_lr.add_trace(go.Scatter(x=by["hour_x"], y=by["勝率_ロング"]*100, mode="lines+markers", name="勝率（ロング）"))
+        fig_h_lr.add_trace(go.Scatter(x=by["hour_x"], y=by["勝率_ショート"]*100, mode="lines+markers", name="勝率（ショート）"))
+        fig_h_lr.update_layout(title="時間別 勝率（ロング/ショート）", xaxis_title="時間", yaxis_title="勝率（%）",
+                               margin=dict(l=10,r=10,t=30,b=10), height=300,
+                               yaxis=dict(range=[0,100]),
+                               xaxis=dict(tickformat="%H:%M", range=x_range))
+        st.plotly_chart(fig_h_lr, use_container_width=True)
+
+        # 取引回数
+        fig_h_cnt = go.Figure([go.Bar(x=by["hour_x"], y=by["取引回数"], name="取引回数")])
+        fig_h_cnt.update_layout(title="時間別 取引回数", xaxis_title="時間", yaxis_title="回",
+                                margin=dict(l=10,r=10,t=30,b=10), height=300,
+                                xaxis=dict(tickformat="%H:%M", range=x_range))
+        st.plotly_chart(fig_h_cnt, use_container_width=True)
+
+        # 平均損益（/回）
+        fig_h_avg = go.Figure([go.Bar(x=by["hour_x"], y=by["平均損益"], name="平均損益（/回）")])
+        fig_h_avg.update_layout(title="時間別 平均損益（/回）", xaxis_title="時間", yaxis_title="円/回",
+                                margin=dict(l=10,r=10,t=30,b=10), height=300,
+                                xaxis=dict(tickformat="%H:%M", range=x_range))
+        st.plotly_chart(fig_h_avg, use_container_width=True)
+
+        # ---- 前場/後場 比較
+        st.markdown("### 前場 / 後場 比較")
+        ses = session_of(dt.loc[d.index])
+        d["セッション"] = ses
+        cmp = d.dropna(subset=["セッション"]).groupby("セッション").agg(
+            収支=("PL","sum"),
+            取引回数=("PL","count"),
+            勝率=("win","mean"),
+            平均損益=("PL","mean")
+        ).reset_index()
+        cmp["勝率"] = (cmp["勝率"]*100).round(1)
+        st.dataframe(cmp, use_container_width=True, hide_index=True)
+        download_button_df(cmp, "⬇ CSVダウンロード（前場後場比較）", "am_pm_compare.csv")
+
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            fig_cmp_pl = go.Figure([go.Bar(x=cmp["セッション"], y=cmp["収支"], name="収支")])
+            fig_cmp_pl.update_layout(title="前場/後場 収支", xaxis_title="", yaxis_title="円",
+                                     margin=dict(l=10,r=10,t=30,b=10), height=300)
+            st.plotly_chart(fig_cmp_pl, use_container_width=True)
+        with cc2:
+            fig_cmp_wr = go.Figure([go.Bar(x=cmp["セッション"], y=cmp["勝率"], name="勝率")])
+            fig_cmp_wr.update_layout(title="前場/後場 勝率", xaxis_title="", yaxis_title="勝率（%）",
+                                     margin=dict(l=10,r=10,t=30,b=10), height=300,
+                                     yaxis=dict(range=[0,100]))
+            st.plotly_chart(fig_cmp_wr, use_container_width=True)
+
+        # ---- 累積勝率の時間推移（5分ビンで全日合算 → 時刻順に累積）
+        st.markdown("### 累積勝率の時間推移（全期間・5分ビン）")
+        # 5分ビン
+        dt_local = dt.loc[d.index]
+        five_bin = dt_local.dt.floor("5min")
+        x_five = to_time_of_day_ts(five_bin)
+        tmp = pd.DataFrame({
+            "x": x_five,
+            "win": d["win"].astype(float),
+            "cnt": 1.0
+        })
+        # 9:00～15:30 の空ビンを作成
+        five_grid = pd.date_range(BASE_ANCHOR_DATE.replace(hour=9,minute=0),
+                                  BASE_ANCHOR_DATE.replace(hour=15,minute=30),
+                                  freq="5min", inclusive="both")
+        base5 = pd.DataFrame({"x": five_grid})
+        agg5 = tmp.groupby("x").agg(win_sum=("win","sum"), cnt=("cnt","sum")).reset_index()
+        grid = base5.merge(agg5, on="x", how="left").fillna(0.0)
+        grid["cum_win"] = grid["win_sum"].cumsum()
+        grid["cum_cnt"] = grid["cnt"].cumsum()
+        grid["cum_wr"]  = np.where(grid["cum_cnt"]>0, grid["cum_win"]/grid["cum_cnt"]*100.0, np.nan)
+
+        fig_cum = go.Figure([go.Scatter(x=grid["x"], y=grid["cum_wr"], mode="lines", name="累積勝率")])
+        fig_cum.update_layout(title="累積勝率（時間の経過とともに）", xaxis_title="時間", yaxis_title="勝率（%）",
+                              margin=dict(l=10,r=10,t=30,b=10), height=320,
+                              yaxis=dict(range=[0,100]),
+                              xaxis=dict(tickformat="%H:%M",
+                                         range=[BASE_ANCHOR_DATE.replace(hour=9,minute=0),
+                                                BASE_ANCHOR_DATE.replace(hour=15,minute=30)]))
+        st.plotly_chart(fig_cum, use_container_width=True)
+
+# ---- 2) 累計
+with tab2:
+    st.markdown("### 累計実現損益（選択期間内、日次ベース）")
+    if realized_f.empty:
+        st.info("実現損益データが必要です。")
+    else:
+        d = realized_f.copy()
+        d["日"] = pd.to_datetime(d["約定日"]).dt.date
+        d["実現損益[円]"] = to_numeric_jp(d["実現損益[円]"])
+        seq = d.groupby("日", as_index=False)["実現損益[円]"].sum().sort_values("日")
+        seq["累計"] = pd.to_numeric(seq["実現損益[円]"], errors="coerce").cumsum()
+        seq_disp = seq.copy()
+        seq_disp["実現損益[円]"] = seq_disp["実現損益[円]"].round(0).astype("Int64")
+        seq_disp["累計"] = seq_disp["累計"].round(0).astype("Int64")
+        st.dataframe(seq_disp, use_container_width=True, hide_index=True)
+        download_button_df(seq_disp, "⬇ CSVダウンロード（累計・日次）", "cumulative_daily_pl.csv")
+        left,right = st.columns(2)
+        with left:
+            fig_bar = go.Figure([go.Bar(x=seq["日"], y=seq["実現損益[円]"], name="日次 実現損益")])
+            fig_bar.update_layout(margin=dict(l=10,r=10,t=20,b=10), height=350, xaxis_title="日付", yaxis_title="実現損益[円]")
+            st.plotly_chart(fig_bar, use_container_width=True)
+        with right:
+            fig_line = go.Figure([go.Scatter(x=seq["日"], y=seq["累計"], mode="lines", name="累計")])
+            fig_line.update_layout(margin=dict(l=10,r=10,t=20,b=10), height=350, xaxis_title="日付", yaxis_title="累計実現損益[円]")
+            st.plotly_chart(fig_line, use_container_width=True)
+
+# ---- 3) 個別銘柄
+def per_symbol_stats(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["銘柄コード","銘柄名","実現損益合計","取引回数","1回平均損益","勝率"])
+    d = normalize_symbol_cols(df.copy())
+    if "実現損益[円]" in d.columns: d["実現損益"] = to_numeric_jp(d["実現損益[円]"])
+    else:
+        cand = next((c for c in d.columns if ("実現" in str(c) and "損益" in str(c))), None)
+        if cand is None: 
+            return pd.DataFrame(columns=["銘柄コード","銘柄名","実現損益合計","取引回数","1回平均損益","勝率"])
+        d["実現損益"] = to_numeric_jp(d[cand])
+    d["win"] = d["実現損益"]>0
+    d["group_key"] = np.where(d["code_key"].notna()&(d["code_key"]!=""), d["code_key"], "NAMEONLY::"+d["name_key"].astype(str))
+    agg = d.groupby("group_key").agg({"実現損益":["sum","count","mean"], "win":["mean"]})
+    agg.columns = ["実現損益合計","取引回数","1回平均損益","勝率"]
+    rep_name = d.groupby("group_key").apply(representative_name).rename("銘柄名")
+    code_col = d.groupby("group_key")["code_key"].first().rename("銘柄コード")
+    out = agg.join(rep_name).join(code_col).reset_index(drop=True).sort_values("実現損益合計", ascending=False)
+    out["銘柄コード"] = out["銘柄コード"].fillna("—")
+    return out
+
+with tab3:
+    st.markdown("### 個別銘柄（勝率・実現損益）")
+    if realized_f.empty:
+        st.info("実現損益データが必要です。")
+    else:
+        sym = per_symbol_stats(realized_f)
+        if not sym.empty:
+            disp = sym.copy()
+            if "1回平均損益" in disp.columns: disp["1回平均損益"] = disp["1回平均損益"].round(0).astype("Int64")
+            if "勝率" in disp.columns: disp["勝率"] = (disp["勝率"]*100).round(1).map(lambda x: f"{x:.1f}%")
+            order = ["銘柄コード","銘柄名","実現損益合計","取引回数","1回平均損益","勝率"]
+            cols = [c for c in order if c in disp.columns] + [c for c in disp.columns if c not in order]
+            st.dataframe(disp[cols], use_container_width=True, hide_index=True)
+            download_button_df(disp[cols], "⬇ CSVダウンロード（個別銘柄）", "per_symbol_stats.csv")
+        else:
+            st.info("集計できるデータがありません。")
+
+# ---- 4) ランキング
+with tab4:
+    st.markdown("### ランキング（選択期間）")
+    if realized_f.empty:
+        st.info("実現損益データが必要です。")
+    else:
+        d = normalize_symbol_cols(realized_f.copy())
+        d["実現損益"] = to_numeric_jp(d["実現損益[円]"]) if "実現損益[円]" in d.columns else np.nan
+        d["group_key"] = np.where(d["code_key"].notna()&(d["code_key"]!=""), d["code_key"], "NAMEONLY::"+d["name_key"].astype(str))
+        by_symbol = d.groupby("group_key").agg({"実現損益":["count","sum","mean"]})
+        by_symbol.columns = ["取引回数","実現損益合計","1回平均損益"]
+        rep_name = d.groupby("group_key").apply(representative_name).rename("銘柄名")
+        code_col = d.groupby("group_key")["code_key"].first().rename("銘柄コード")
+        out = by_symbol.join(rep_name).join(code_col).reset_index(drop=True)
+        out["銘柄コード"] = out["銘柄コード"].fillna("—")
+        if "1回平均損益" in out.columns: out["1回平均損益"] = out["1回平均損益"].round(0).astype("Int64")
+        left,right = st.columns(2)
+        with left:
+            sort_key = st.selectbox("ソート指標", ["実現損益合計","取引回数","1回平均損益"], index=0)
+        with right:
+            topn = st.slider("表示件数", 5, 100, 20)
+        out = out.sort_values(sort_key, ascending=False).head(topn)
+        order = ["銘柄コード","銘柄名","実現損益合計","取引回数","1回平均損益"]
+        cols = [c for c in order if c in out.columns] + [c for c in out.columns if c not in order]
+        st.dataframe(out[cols], use_container_width=True, hide_index=True)
+        download_button_df(out[cols], "⬇ CSVダウンロード（ランキング）", "ranking.csv")
+
+# ---- 5) 3分足 IN/OUT + VWAP/MA（＋日経先物・日経平均）
+with tab5:
+    st.markdown("### 個別銘柄の3分足 + IN/OUT（当日指定｜時刻付き約定のみ）＋ 指標（VWAP/MA）")
+
+    exec_all = build_exec_table_allperiod(yakujyou_all) if not yakujyou_all.empty else pd.DataFrame()
+
+    ohlc_min_d, ohlc_max_d = ohlc_global_date_range(ohlc_map)
+    allow_ohlc_only = st.checkbox("約定が無い日でも3分足を表示する", value=True)
+    if allow_ohlc_only and (ohlc_min_d is not None) and (ohlc_max_d is not None):
+        default_d = ohlc_max_d
+        sel_date = st.date_input("日付を選択", value=default_d, min_value=ohlc_min_d, max_value=ohlc_max_d)
+    else:
+        if not exec_all.empty:
+            dates = sorted(exec_all["exec_time"].dt.date.dropna().unique().tolist())
+            if dates:
+                sel_date = st.date_input("日付を選択（IN/OUTがある日）", value=dates[-1], min_value=dates[0], max_value=dates[-1])
+            else:
+                sel_date = st.date_input("日付を選択", value=date.today())
+        else:
+            sel_date = st.date_input("日付を選択", value=date.today())
+
+    ohlc_code_index = build_ohlc_code_index(ohlc_map)
+    all_codes_in_ohlc = sorted(ohlc_code_index.keys())
+    sel_options = []
+    if not exec_all.empty:
+        day_exec = exec_all[exec_all["exec_time"].dt.date == sel_date]
+        sel_options = sorted(day_exec["code_key"].dropna().unique().tolist())
+    if not sel_options and all_codes_in_ohlc:
+        sel_options = all_codes_in_ohlc
+    if not sel_options:
+        st.warning("表示できる銘柄データ（約定履歴 or 3分足）がありません。")
+        st.stop()
+
+    CODE_TO_NAME = build_code_to_name_map(realized, yakujyou_all)
+    selected_code = st.selectbox(
+        "銘柄を選択",
+        options=sel_options,
+        index=0,
+        format_func=lambda c: f"{c}｜{CODE_TO_NAME.get(str(c).upper(), '名称不明')}"
+    )
+    if not selected_code: st.stop()
+    code4 = str(selected_code).upper()
+    disp_nm = CODE_TO_NAME.get(code4, "名称不明")
+
+    st.markdown("#### 約定履歴（当日）")
+    trades_tbl = build_trade_table_for_display(yakujyou_all, sel_date, code4)
+    if trades_tbl.empty:
+        st.info("当日の約定履歴がありません。")
+    else:
+        st.dataframe(trades_tbl, use_container_width=True, hide_index=True)
+        download_button_df(trades_tbl, "⬇ CSVダウンロード（約定履歴・当日）", f"trades_{code4}_{sel_date}.csv")
+
+    best_key, ohlc, dbg = pick_best_ohlc_key_for_date(code4, ohlc_code_index, ohlc_map, sel_date)
+    if best_key is None or ohlc is None or ohlc.empty:
+        st.error(f"銘柄コード {code4} の3分足データが見つかりません。"
+                 "\nヒント：3分足ファイル名の末尾に `_7974` のようなコードを含めてください。")
+        st.stop()
+    auto_key = best_key
+
+    # タイムゾーン/日付範囲
+    if getattr(ohlc["time"].dtype,"tz",None) is None:
+        ohlc["time"] = pd.to_datetime(ohlc["time"], errors="coerce").dt.tz_localize(TZ)
+    else:
+        ohlc["time"] = ohlc["time"].dt.tz_convert(TZ)
+    start_dt = pd.Timestamp(f"{sel_date} 09:00", tz=TZ)
+    end_dt   = pd.Timestamp(f"{sel_date} 15:30", tz=TZ)
+    ohlc_day = ohlc.loc[(ohlc["time"]>=start_dt) & (ohlc["time"]<=end_dt)].copy()
+    if ohlc_day.empty:
+        st.warning(f"{sel_date} の {code4} の3分足データがありません。")
+        st.stop()
+
+    # マーカー
+    marker_groups = {}
+    skipped_price = 0
+    if not exec_all.empty:
+        marks = exec_all[(exec_all["exec_time"].dt.date == sel_date) & (exec_all["code_key"]==code4)].copy()
+        in_window = (marks["exec_time"]>=start_dt) & (marks["exec_time"]<=end_dt)
+        marks = marks.loc[in_window].copy()
+        if not marks.empty:
+            ohlc_idx = (ohlc_day[["time","close"]]
+                        .rename(columns={"time":"ohlc_time","close":"ohlc_close"})
+                        .sort_values("ohlc_time"))
+            mk = marks.sort_values("exec_time").copy()
+            mk["exec_time_floor"] = mk["exec_time"]
+            merged = pd.merge_asof(
+                mk.sort_values("exec_time_floor"),
+                ohlc_idx,
+                left_on="exec_time_floor",
+                right_on="ohlc_time",
+                direction="nearest",
+                tolerance=pd.Timedelta("6min")
+            )
+            merged["price"] = merged["price"].fillna(merged["ohlc_close"])
+            skipped_price = merged["price"].isna().sum()
+            merged = merged.dropna(subset=["price"])
+
+            for act in ["買建","売建","売埋","買埋"]:
+                df_act = merged[merged["action"]==act][["exec_time","price"]].copy()
+                if not df_act.empty:
+                    marker_groups[act] = df_act
+
+    st.caption(
+        f"自動選択: **{code4}｜{disp_nm}**（ファイル: {auto_key}）｜"
+        "IN/OUTは時刻付き約定のみ。価格欠損はOHLC近傍で補完（±6分）"
+    )
+
+    # === 表示オプション ===
+    left, mid, right = st.columns([2,2,3])
+    with left:
+        tf_label = st.selectbox(
+            "タイムフレーム",
+            ["そのまま","6分","9分","15分"],
+            index=0,
+            help="元データより細かい足は作れません（3分→6/9/15分などに集約）。"
+        )
+    with mid:
+        show_breaks = st.checkbox(
+            "取引時間外と昼休みを隠す（レンジブレイク）",
+            value=True,
+            help="土日・夜間（15:30〜翌9:00）・昼休み（11:30〜12:30）を非表示にします。"
+        )
+    with right:
+        show_lines = st.multiselect(
+            "ラインの表示",
+            options=["VWAP","MA1","MA2","MA3"],
+            default=[x for x in ["VWAP","MA1","MA2"] if x in ohlc_day.columns],
+        )
+
+    enlarge = st.checkbox("🔍 チャートを拡大表示", value=False)
+    chart_h = LARGE_CHART_HEIGHT if enlarge else MAIN_CHART_HEIGHT
+
+    # タイムフレーム適用
+    ohlc_disp = ohlc_day.copy()
+    base_min = _detect_base_interval_minutes(ohlc_disp["time"])
+    tf_map = {"そのまま": None, "6分":"6min", "9分":"9min", "15分":"15min"}
+    target_rule = tf_map[tf_label]
+    if target_rule:
+        tgt_min = int(target_rule.replace("min",""))
+        if base_min is not None and tgt_min >= base_min:
+            ohlc_disp = _resample_ohlc(ohlc_disp, target_rule)
+        else:
+            st.caption("⚠ 元データより細かい間隔は作れないため、そのまま表示しています。")
+
+    # ==== 色設定（MA3=青）
+    COLOR_VWAP = "#808080"    # グレー
+    COLOR_MA1  = "#2ca02c"    # 緑
+    COLOR_MA2  = "#ff7f0e"    # オレンジ
+    COLOR_MA3  = "#1f77b4"    # 青
+
+    # ==== 個別銘柄チャート（マーカー付き）
+    fig = go.Figure()
+    fig.add_candlestick(
+        x=ohlc_disp["time"], open=ohlc_disp["open"], high=ohlc_disp["high"],
+        low=ohlc_disp["low"], close=ohlc_disp["close"], name="3分足"
+    )
+    if "VWAP" in show_lines and "VWAP" in ohlc_disp.columns and ohlc_disp["VWAP"].notna().any():
+        fig.add_trace(go.Scatter(x=ohlc_disp["time"], y=ohlc_disp["VWAP"], mode="lines",
+                                 line=dict(color=COLOR_VWAP, width=2), name="VWAP"))
+    if "MA1" in show_lines and "MA1" in ohlc_disp.columns and ohlc_disp["MA1"].notna().any():
+        fig.add_trace(go.Scatter(x=ohlc_disp["time"], y=ohlc_disp["MA1"], mode="lines",
+                                 line=dict(color=COLOR_MA1, width=1.8), name="MA1"))
+    if "MA2" in show_lines and "MA2" in ohlc_disp.columns and ohlc_disp["MA2"].notna().any():
+        fig.add_trace(go.Scatter(x=ohlc_disp["time"], y=ohlc_disp["MA2"], mode="lines",
+                                 line=dict(color=COLOR_MA2, width=1.8), name="MA2"))
+    if "MA3" in show_lines and "MA3" in ohlc_disp.columns and ohlc_disp["MA3"].notna().any():
+        fig.add_trace(go.Scatter(x=ohlc_disp["time"], y=ohlc_disp["MA3"], mode="lines",
+                                 line=dict(color=COLOR_MA3, width=1.8), name="MA3"))
+
+    # IN/OUT／建埋マーカー
+    COLOR_MAP = {"買建":"#ff69b4","売建":"#1f77b4","売埋":"#2ca02c","買埋":"#ff7f0e"}
+    SYMBOL_MAP = {"買建":"triangle-up","売建":"triangle-up","売埋":"triangle-down","買埋":"triangle-down"}
+    TEXT_POS   = {"買建":"top center","売建":"top center","売埋":"bottom center","買埋":"bottom center"}
+    for act, df_act in marker_groups.items():
+        fig.add_trace(go.Scatter(
+            x=df_act["exec_time"], y=df_act["price"],
+            mode="markers+text",
+            text=[act]*len(df_act), textposition=TEXT_POS.get(act, "top center"),
+            marker_symbol=SYMBOL_MAP.get(act, "circle"),
+            marker_size=10,
+            marker_color=COLOR_MAP.get(act, "#444"),
+            name=act,
+            hovertemplate="時刻=%{x|%H:%M:%S}<br>価格=%{y:.2f}<extra>"+act+"</extra>",
+        ))
+
+    fig.update_layout(
+        title=f"{sel_date} - {disp_nm} ({code4}) 3分足",
+        height=chart_h, xaxis_title="時刻", yaxis_title="価格",
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        margin=dict(l=10,r=10,t=30,b=10),
+        xaxis=dict(tickformat="%H:%M")
+    )
+    # 範囲＆ブレイク
+    fig.add_vline(x=pd.Timestamp(f"{sel_date} 09:00", tz=TZ), line=dict(width=1, dash="dot", color="#999"))
+    fig.add_vline(x=pd.Timestamp(f"{sel_date} 15:30", tz=TZ), line=dict(width=1, dash="dot", color="#999"))
+    if show_breaks:
+        fig.update_xaxes(rangebreaks=[
+            dict(bounds=["sat","mon"]),
+            dict(bounds=[15.5,9], pattern="hour"),
+            dict(bounds=[11.5,12.5], pattern="hour"),
+        ])
+    fig.update_xaxes(range=[start_dt, end_dt])
+    st.plotly_chart(fig, use_container_width=True)
+
+    if skipped_price > 0:
+        st.warning(f"価格を補完できずマーカーを表示できなかった約定: {skipped_price} 件（±6分に足が無い 等）")
+
+    # ===== 日経先物 =====
+    st.markdown("#### 日経先物（OSE_NK2251!）")
+    def find_first_key_by_prefix(ohlc_map: dict, prefix: str, sel_date: date | None = None) -> str | None:
+        if not ohlc_map: return None
+        pfx = prefix.lower()
+        cands = [k for k in ohlc_map.keys() if k.lower().startswith(pfx)]
+        if not cands: return None
+        def norm_t(s: pd.Series):
+            return s.dt.tz_localize(TZ) if getattr(s.dtype,"tz",None) is None else s.dt.tz_convert(TZ)
+        if sel_date is None:
+            best = max(cands, key=lambda k: norm_t(ohlc_map[k]["time"]).max())
+            return best
+        s_dt, e_dt = market_time(sel_date)
+        def score(k):
+            t = norm_t(ohlc_map[k]["time"])
+            if t.empty:
+                return (3, float("inf"), float("-inf"))
+            in_win   = ((t>=s_dt)&(t<=e_dt)).any()
+            same_day = (t.dt.date==sel_date).any()
+            sel_ts   = pd.Timestamp(sel_date, tz=TZ)
+            tmin, tmax = t.min(), t.max()
+            if tmax < sel_ts:
+                dd = (sel_ts - tmax).total_seconds()
+            elif tmin > sel_ts:
+                dd = (tmin - sel_ts).total_seconds()
+            else:
+                dd = 0.0
+            return (0 if in_win else (1 if same_day else 2), dd, -tmax.value)
+        cands.sort(key=score)
+        return cands[0]
+
+    key_fut = find_first_key_by_prefix(ohlc_map, "OSE_NK2251!", sel_date)
+    if key_fut:
+        o = ohlc_map[key_fut].copy()
+        if getattr(o["time"].dtype,"tz",None) is None: o["time"] = pd.to_datetime(o["time"], errors="coerce").dt.tz_localize(TZ)
+        else: o["time"] = o["time"].dt.tz_convert(TZ)
+        o_day = o.loc[(o["time"]>=start_dt)&(o["time"]<=end_dt)].copy()
+        if not o_day.empty:
+            o_disp = o_day.copy()
+            base_min2 = _detect_base_interval_minutes(o_disp["time"])
+            if target_rule:
+                tgt_min = int(target_rule.replace("min",""))
+                if base_min2 is not None and tgt_min >= base_min2:
+                    o_disp = _resample_ohlc(o_disp, target_rule)
+
+            fig2 = go.Figure()
+            fig2.add_candlestick(x=o_disp["time"], open=o_disp["open"], high=o_disp["high"], low=o_disp["low"], close=o_disp["close"], name="3分足")
+            if "VWAP" in show_lines and "VWAP" in o_disp.columns and o_disp["VWAP"].notna().any():
+                fig2.add_trace(go.Scatter(x=o_disp["time"], y=o_disp["VWAP"], mode="lines", line=dict(color=COLOR_VWAP, width=2), name="VWAP"))
+            if "MA1" in show_lines and "MA1" in o_disp.columns and o_disp["MA1"].notna().any():
+                fig2.add_trace(go.Scatter(x=o_disp["time"], y=o_disp["MA1"], mode="lines", line=dict(color=COLOR_MA1, width=1.8), name="MA1"))
+            if "MA2" in show_lines and "MA2" in o_disp.columns and o_disp["MA2"].notna().any():
+                fig2.add_trace(go.Scatter(x=o_disp["time"], y=o_disp["MA2"], mode="lines", line=dict(color=COLOR_MA2, width=1.8), name="MA2"))
+            if "MA3" in show_lines and "MA3" in o_disp.columns and o_disp["MA3"].notna().any():
+                fig2.add_trace(go.Scatter(x=o_disp["time"], y=o_disp["MA3"], mode="lines", line=dict(color=COLOR_MA3, width=1.8), name="MA3"))
+            fig2.update_layout(
+                height=chart_h, xaxis_title="時刻", yaxis_title="価格",
+                xaxis_rangeslider_visible=False, hovermode="x unified",
+                margin=dict(l=10,r=10,t=10,b=10), xaxis=dict(tickformat="%H:%M"),
+                title=f"{sel_date} - OSE_NK2251!（ファイル: {key_fut}）"
+            )
+            if show_breaks:
+                fig2.update_xaxes(rangebreaks=[
+                    dict(bounds=["sat","mon"]),
+                    dict(bounds=[15.5,9], pattern="hour"),
+                    dict(bounds=[11.5,12.5], pattern="hour"),
+                ])
+            fig2.update_xaxes(range=[start_dt, end_dt])
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("当日の先物データが見つかりませんでした。")
+    else:
+        st.info("先物ファイル（プレフィックス 'OSE_NK2251!'）が見つかりません。")
+
+    # ===== 日経平均 =====
+    st.markdown("#### 日経平均（TVC_NI225）")
+    key_cfd = find_first_key_by_prefix(ohlc_map, "TVC_NI225", sel_date)
+    if key_cfd:
+        o = ohlc_map[key_cfd].copy()
+        if getattr(o["time"].dtype,"tz",None) is None: o["time"] = pd.to_datetime(o["time"], errors="coerce").dt.tz_localize(TZ)
+        else: o["time"] = o["time"].dt.tz_convert(TZ)
+        o_day = o.loc[(o["time"]>=start_dt)&(o["time"]<=end_dt)].copy()
+        if not o_day.empty:
+            o_disp = o_day.copy()
+            base_min3 = _detect_base_interval_minutes(o_disp["time"])
+            if target_rule:
+                tgt_min = int(target_rule.replace("min",""))
+                if base_min3 is not None and tgt_min >= base_min3:
+                    o_disp = _resample_ohlc(o_disp, target_rule)
+
+            fig3 = go.Figure()
+            fig3.add_candlestick(x=o_disp["time"], open=o_disp["open"], high=o_disp["high"], low=o_disp["low"], close=o_disp["close"], name="3分足")
+            if "VWAP" in show_lines and "VWAP" in o_disp.columns and o_disp["VWAP"].notna().any():
+                fig3.add_trace(go.Scatter(x=o_disp["time"], y=o_disp["VWAP"], mode="lines", line=dict(color=COLOR_VWAP, width=2), name="VWAP"))
+            if "MA1" in show_lines and "MA1" in o_disp.columns and o_disp["MA1"].notna().any():
+                fig3.add_trace(go.Scatter(x=o_disp["time"], y=o_disp["MA1"], mode="lines", line=dict(color=COLOR_MA1, width=1.8), name="MA1"))
+            if "MA2" in show_lines and "MA2" in o_disp.columns and o_disp["MA2"].notna().any():
+                fig3.add_trace(go.Scatter(x=o_disp["time"], y=o_disp["MA2"], mode="lines", line=dict(color=COLOR_MA2, width=1.8), name="MA2"))
+            if "MA3" in show_lines and "MA3" in o_disp.columns and o_disp["MA3"].notna().any():
+                fig3.add_trace(go.Scatter(x=o_disp["time"], y=o_disp["MA3"], mode="lines", line=dict(color=COLOR_MA3, width=1.8), name="MA3"))
+            fig3.update_layout(
+                height=chart_h, xaxis_title="時刻", yaxis_title="価格",
+                xaxis_rangeslider_visible=False, hovermode="x unified",
+                margin=dict(l=10,r=10,t=10,b=10), xaxis=dict(tickformat="%H:%M"),
+                title=f"{sel_date} - TVC_NI225（ファイル: {key_cfd}）"
+            )
+            if show_breaks:
+                fig3.update_xaxes(rangebreaks=[
+                    dict(bounds=["sat","mon"]),
+                    dict(bounds=[15.5,9], pattern="hour"),
+                    dict(bounds=[11.5,12.5], pattern="hour"),
+                ])
+            fig3.update_xaxes(range=[start_dt, end_dt])
+            st.plotly_chart(fig3, use_container_width=True)
+        else:
+            st.info("当日の日経平均データが見つかりませんでした。")
+    else:
+        st.info("日経平均ファイル（プレフィックス 'TVC_NI225'）が見つかりません。")
