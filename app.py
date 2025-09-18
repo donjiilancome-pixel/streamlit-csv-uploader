@@ -121,6 +121,7 @@ def concat_uploaded_tables(files, sig: str, add_source_col: bool=True) -> pd.Dat
         frames.append(df)
     return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
+# ---- JSTのSeriesに強制変換する安全ヘルパー（★追加）
 def _to_jst_series(obj, index) -> pd.Series:
     """
     obj が Series のときはそれを datetime64[ns] にして返す。
@@ -132,7 +133,6 @@ def _to_jst_series(obj, index) -> pd.Series:
     else:
         s = pd.Series(pd.NaT, index=index, dtype="datetime64[ns]")
 
-    # タイムゾーン付与/変換
     if hasattr(s.dtype, "tz") and s.dtype.tz is None:
         try:
             s = s.dt.tz_localize(TZ)
@@ -297,9 +297,9 @@ def detect_pl_column(d: pd.DataFrame) -> str | None:
         if ratio > best_ratio: best_ratio, best = ratio, c
     return best
 
-# ---- 実現損益の正規化（★パッチ）
+# ---- 実現損益の正規化
 def normalize_realized(df: pd.DataFrame) -> pd.DataFrame:
-    """'約定日時','約定日','実現損益[円]' を生成。時刻が無い場合は 00:00:00（後で推定補完）。"""
+    """'約定日時','約定日','実現損益[円]' を生成。時刻が無い場合は 00:00（後で推定補完）。"""
     if df is None or df.empty: 
         return df
     d = clean_columns(df.copy())
@@ -344,7 +344,7 @@ def normalize_yakujyou(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return df
     return normalize_symbol_cols(df.copy())
 
-# ---- 実現損益に約定履歴から時刻を推定付与（★パッチ）
+# ---- 実現損益に約定履歴から時刻を推定付与
 def attach_exec_time_from_yak(realized_df: pd.DataFrame, yak_df: pd.DataFrame) -> pd.DataFrame:
     """
     実現損益の各行に対し、同一日×同一コード×同一アクション（買埋/売埋）の約定から
@@ -367,9 +367,8 @@ def attach_exec_time_from_yak(realized_df: pd.DataFrame, yak_df: pd.DataFrame) -
     else:
         y["約定日時"] = pd.NaT
 
-    if getattr(y["約定日時"].dtype, "tz", None) is None:
-        try: y["約定日時"] = y["約定日時"].dt.tz_localize(TZ)
-        except Exception: y["約定日時"] = y["約定日時"].dt.tz_convert(TZ)
+    # JSTへ
+    y["約定日時"] = _to_jst_series(y["約定日時"], y.index)
 
     y["__day__"]   = y["約定日時"].dt.date
     # 代表的な列名を探索
@@ -419,7 +418,7 @@ def attach_exec_time_from_yak(realized_df: pd.DataFrame, yak_df: pd.DataFrame) -
 
 # ---- セッション（“秒”で比較）
 def session_of(dt_series: pd.Series) -> pd.Series:
-    dt_local = dt_series.dt.tz_convert(TZ)
+    dt_local = _to_jst_series(dt_series, dt_series.index)
     sec = dt_local.dt.hour*3600 + dt_local.dt.minute*60 + dt_local.dt.second
     out = pd.Series(pd.NA, index=dt_series.index, dtype="object")
     out[(sec >= MORNING_START_SEC) & (sec <= MORNING_END_SEC)]  = "前場"
@@ -456,10 +455,9 @@ def load_ohlc_map_from_uploads(files, sig: str):
             continue
 
         df = df.rename(columns=col_rename_map)
-
         t = pd.to_datetime(df["time"], errors="coerce", infer_datetime_format=True)
-        if getattr(t.dtype, "tz", None) is None: t = t.dt.tz_localize(TZ)
-        else: t = t.dt.tz_convert(TZ)
+        # JST化
+        t = _to_jst_series(t, t.index)
         df = df.copy(); df["time"] = t
 
         def pick_one(df, names):
@@ -500,8 +498,7 @@ def ohlc_global_date_range(ohlc_map: dict):
     mins, maxs = [], []
     for df in ohlc_map.values():
         if df is None or df.empty or "time" not in df.columns: continue
-        t = df["time"]
-        t = t.dt.tz_localize(TZ) if getattr(t.dtype,"tz",None) is None else t.dt.tz_convert(TZ)
+        t = _to_jst_series(df["time"], df.index)
         if t.notna().any():
             mins.append(t.min().date()); maxs.append(t.max().date())
     if not mins or not maxs: return None, None
@@ -543,22 +540,22 @@ realized = normalize_realized(clean_columns(realized))
 ohlc_map = load_ohlc_map_from_uploads(ohlc_files, sig_ohlc)
 CODE_TO_NAME = build_code_to_name_map(realized, yakujyou_all)
 
-# --- 実現損益に「約定履歴から時刻を推定付与」→ 最終列を作成（★パッチ要）
+# --- 実現損益に「約定履歴から時刻を推定付与」→ 最終列を作成（★安全版）
 realized = attach_exec_time_from_yak(realized, yakujyou_all)
 
-# --- 最終的に使う日時列を安全に生成 ---
+# JSTのSeriesに揃える（欠損ならNaT Series）
 dt_real = _to_jst_series(realized["約定日時"]       if "約定日時" in realized.columns else None, realized.index)
 dt_est  = _to_jst_series(realized["約定日時_推定"]   if "約定日時_推定" in realized.columns else None, realized.index)
 
 has_real_time = dt_real.notna() & ((dt_real.dt.hour + dt_real.dt.minute + dt_real.dt.second) > 0)
 realized["約定日時_final"] = dt_real.where(has_real_time, dt_est)
 
-if "約定日" not in realized.columns or realized["約定日"].isna().all():
-    realized["約定日_final"] = pd.to_datetime(realized["約定日時_final"], errors="coerce").dt.tz_convert(TZ).dt.date
+# 約定日_final：元の約定日があれば優先、無ければ約定日時_finalから補完
+if "約定日" in realized.columns:
+    day_raw_date = pd.to_datetime(realized["約定日"], errors="coerce").dt.date
 else:
-    tmp_day  = pd.to_datetime(realized["約定日"], errors="coerce").dt.date
-    fallback = pd.to_datetime(realized["約定日時_final"], errors="coerce").dt.tz_convert(TZ).dt.date
-    realized["約定日_final"] = np.where(pd.isna(tmp_day), fallback, tmp_day)
+    day_raw_date = pd.Series([pd.NaT]*len(realized), index=realized.index, dtype="object")
+realized["約定日_final"] = np.where(pd.notna(day_raw_date), day_raw_date, _to_jst_series(realized["約定日時_final"], realized.index).dt.date)
 
 # ===== デバッグ表示 =====
 with st.expander("🛠 実現損益 正規化の診断"):
@@ -691,10 +688,10 @@ with tab1b:
         if d.empty:
             st.info("実現損益の数値が見つかりません。")
         else:
-            dt_real = _to_jst_series(d["約定日時_final"] if "約定日時_final" in d.columns else None, d.index)
+            dt = _to_jst_series(d["約定日時_final"] if "約定日時_final" in d.columns else None, d.index)
 
-            valid = dt_real.notna()
-            d, dt = d.loc[valid].copy(), dt_real.loc[valid]
+            valid = dt.notna()
+            d, dt = d.loc[valid].copy(), dt.loc[valid]
 
             # 市場時間内
             sec = dt.dt.hour*3600 + dt.dt.minute*60 + dt.dt.second
@@ -899,12 +896,8 @@ def align_trades_to_ohlc(ohlc: pd.DataFrame, trades: pd.DataFrame, max_gap_min=6
     if ohlc is None or ohlc.empty or trades is None or trades.empty:
         return pd.DataFrame(columns=["time","price","side","qty","kind"])
     tdf = trades.copy()
-    # trades: 約定日時
-    t = pd.to_datetime(tdf["約定日時"], errors="coerce")
-    if getattr(t.dtype, "tz", None) is None:
-        try: t = t.dt.tz_localize(TZ)
-        except Exception: t = t.dt.tz_convert(TZ)
-    tdf["約定日時"] = t
+    # trades: 約定日時（JST化）
+    tdf["約定日時"] = _to_jst_series(tdf["約定日時"] if "約定日時" in tdf.columns else None, tdf.index)
 
     # 必要列
     price_col = next((c for c in ["約定単価(円)","約定単価（円）","約定価格","価格","約定単価"] if c in tdf.columns), None)
@@ -932,9 +925,7 @@ def align_trades_to_ohlc(ohlc: pd.DataFrame, trades: pd.DataFrame, max_gap_min=6
 
     # 近傍マッチ
     odf = ohlc.copy()
-    tt = pd.to_datetime(odf["time"], errors="coerce")
-    if getattr(tt.dtype, "tz", None) is None:
-        tt = tt.dt.tz_localize(TZ)
+    tt = _to_jst_series(odf["time"], odf.index)
     odf = odf.set_index(tt)
 
     out_rows = []
@@ -1023,11 +1014,8 @@ with tab5:
                     if this_code:
                         yak = yak[yak["code_key"].astype(str).str.upper()==this_code.upper()]
                 # 時間内
-                y_dt = pd.to_datetime(yak.get(pick_dt_col(yak) or "約定日", pd.NaT), errors="coerce")
-                try:
-                    y_dt = y_dt.dt.tz_localize(TZ)
-                except Exception:
-                    y_dt = y_dt.dt.tz_convert(TZ)
+                y_dtcol = pick_dt_col(yak) or "約定日"
+                y_dt = _to_jst_series(yak[y_dtcol] if y_dtcol in yak.columns else None, yak.index)
                 yak = yak.copy()
                 yak["約定日時"] = y_dt
                 yak = yak[(yak["約定日時"]>=t0) & (yak["約定日時"]<=t1)]
