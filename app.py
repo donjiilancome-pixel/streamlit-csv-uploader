@@ -405,21 +405,46 @@ def attach_exec_time_from_yak(realized_df: pd.DataFrame, yak_df: pd.DataFrame) -
     st.caption(f"🧩 実現損益に時刻を推定付与：{matched} 件マッチ（買埋/売埋のみ対象）")
     return d
 
-# ゆるめの時刻補完：同一日×同一コードの代表時刻で補完
+# ゆるめの時刻補完：同一日×同一コードの代表時刻で補完（★修正版）
 def enrich_times_lenient(realized_df: pd.DataFrame, yak_df: pd.DataFrame) -> pd.DataFrame:
     """
     約定日時_final が NaT または 00:00 の行に対し、
     同一日×同一コードの約定履歴から“代表時刻（中央値付近）”を補完する（アクション不問）。
+    日付基準は ①約定日_final → ②約定日 → ③約定日時系(final/実/推定) から生成。
     """
     if realized_df.empty or yak_df.empty:
         return realized_df
 
     d = realized_df.copy()
-    dt = _to_jst_series(d["約定日時_final"] if "約定日時_final" in d.columns else None, d.index)
-    no_time = dt.isna() | ((dt.dt.hour==0) & (dt.dt.minute==0) & (dt.dt.second==0))
+
+    # 現在の最終時刻列
+    dt_final = _to_jst_series(d["約定日時_final"] if "約定日時_final" in d.columns else None, d.index)
+    no_time = dt_final.isna() | ((dt_final.dt.hour==0) & (dt_final.dt.minute==0) & (dt_final.dt.second==0))
     if not no_time.any():
         return d
 
+    # ---- 補完に使う基準日（Series保証）
+    if "約定日_final" in d.columns:
+        day_base = pd.to_datetime(d["約定日_final"], errors="coerce")
+    elif "約定日" in d.columns:
+        day_base = pd.to_datetime(d["約定日"], errors="coerce")
+    else:
+        # 日付列が無い場合は、約定日時系から日付を生成
+        if "約定日時_final" in d.columns:
+            day_base = _to_jst_series(d["約定日時_final"], d.index)
+        elif "約定日時" in d.columns:
+            day_base = _to_jst_series(d["約定日時"], d.index)
+        elif "約定日時_推定" in d.columns:
+            day_base = _to_jst_series(d["約定日時_推定"], d.index)
+        else:
+            day_base = pd.Series(pd.NaT, index=d.index, dtype="datetime64[ns, Asia/Tokyo]")
+    # tz-aware → date 抽出
+    if hasattr(day_base.dtype, "tz"):
+        d["__day__"] = day_base.dt.date
+    else:
+        d["__day__"] = pd.to_datetime(day_base, errors="coerce").dt.date
+
+    # ---- 約定履歴側の代表時刻（同一日×同一コードの中央値）
     y = normalize_symbol_cols(clean_columns(yak_df.copy()))
     y_dtcol = pick_dt_col(y) or "約定日"
     y_dt = _to_jst_series(y[y_dtcol] if y_dtcol in y.columns else None, y.index)
@@ -432,14 +457,13 @@ def enrich_times_lenient(realized_df: pd.DataFrame, yak_df: pd.DataFrame) -> pd.
               .apply(lambda s: s.sort_values().iloc[len(s)//2])
               .rename("__rep_dt__"))
 
-    d["__day__"] = pd.to_datetime(d.get("約定日_final", pd.NaT), errors="coerce").dt.date
     ck = d["code_key"] if "code_key" in d.columns else pd.Series([""]*len(d), index=d.index)
     d["__ck__"] = ck.fillna("").astype(str).str.upper()
 
     m = d.merge(rep.reset_index(), how="left",
                 left_on=["__day__","__ck__"], right_on=["__day__","code_key"])
     fill = _to_jst_series(m["__rep_dt__"], m.index)
-    dt_new = dt.where(~no_time, fill)
+    dt_new = dt_final.where(~no_time, fill)
     d["約定日時_final"] = dt_new
     return d
 
@@ -472,7 +496,6 @@ def load_ohlc_map_from_uploads(files, sig: str):
             "close": ["close","終値","Close","終","C"],
         }
         original_cols = {c.lower(): c for c in df.columns}
-        # lower対応
         for std, cands in CANDIDATES.items():
             for cand in cands:
                 lc = cand.lower()
@@ -578,7 +601,7 @@ dt_est  = _to_jst_series(realized["約定日時_推定"]   if "約定日時_推�
 has_real_time = dt_real.notna() & ((dt_real.dt.hour + dt_real.dt.minute + dt_real.dt.second) > 0)
 realized["約定日時_final"] = dt_real.where(has_real_time, dt_est)
 
-# ゆるめ補完でさらに埋める
+# ゆるめ補完でさらに埋める（★ここで日付列未作成でも動くように修正済み）
 realized = enrich_times_lenient(realized, yakujyou_all)
 
 # 約定日_final：元の約定日があれば優先、無ければ約定日時_finalから補完
