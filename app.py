@@ -22,10 +22,10 @@ MAIN_CHART_HEIGHT = 600   # 標準の高さ
 LARGE_CHART_HEIGHT = 860  # 拡大表示時の高さ
 
 # 時間帯（前場/後場）
-MORNING_START = time(9,0)
-MORNING_END   = time(11,30)
-AFTERNOON_START = time(12,30)
-AFTERNOON_END   = time(15,30)
+MORNING_START_SEC = 9*3600
+MORNING_END_SEC   = 11*3600 + 30*60
+AFTERNOON_START_SEC = 12*3600 + 30*60
+AFTERNOON_END_SEC   = 15*3600 + 30*60
 
 # =========================================================
 # ユーティリティ
@@ -190,7 +190,7 @@ def pick_dt_col(df: pd.DataFrame, preferred=None) -> str | None:
 
 def pick_time_col(df: pd.DataFrame, preferred=None) -> str | None:
     if df is None or df.empty: return None
-    cands = preferred or ["約定時刻","約定時間","時刻","時間"]
+    cands = preferred or ["約定時刻","約定時間","時刻","時間","約定時刻(JST)","約定時間(日本)","時間(JST)"]
     for c in cands:
         if c in df.columns: return c
     for c in df.columns:
@@ -198,7 +198,6 @@ def pick_time_col(df: pd.DataFrame, preferred=None) -> str | None:
     return None
 
 def _contains_time_string(s: pd.Series) -> pd.Series:
-    """列文字列に時刻表現が含まれるか（hh:mm, 数値hhmmss, '時分' など）"""
     ss = s.astype(str)
     has_hms = ss.str.contains(r"\d{1,2}[:：]\d{1,2}")
     has_num = ss.str.contains(r"\b\d{3,6}\b")
@@ -278,17 +277,12 @@ def normalize_realized(df: pd.DataFrame) -> pd.DataFrame:
     time_col = pick_time_col(d)
 
     # --- 約定日時の生成 ---
-    # 1) 日付＋時刻の別列がある → 確実に結合
     if date_col and time_col:
         ts = combine_date_time_cols(d, date_col, time_col)
         has_time_raw = d[time_col].astype(str).str.strip().ne("")
-
-    # 2) 日付列の中に時刻が埋まっている（"2025/09/12 9:05" や "2025/09/12 90500" 等）
     elif date_col and _contains_time_string(d[date_col]).any():
         ts = parse_datetime_from_dtcol(d, date_col)
         has_time_raw = _contains_time_string(d[date_col])
-
-    # 3) 日付だけ（時刻が全く無い）
     elif date_col:
         ts = pd.to_datetime(d[date_col], errors="coerce", infer_datetime_format=True)
         try:
@@ -296,13 +290,11 @@ def normalize_realized(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             ts = ts.dt.tz_convert(TZ)
         has_time_raw = pd.Series(False, index=d.index)
-
-    # 4) 日付列が見つからない
     else:
         ts = pd.Series(pd.NaT, index=d.index, dtype="datetime64[ns]")
         has_time_raw = pd.Series(False, index=d.index)
 
-    # TZ付与（上流で付与済みでも再保証）
+    # TZ付与（再保証）
     if getattr(ts.dtype, "tz", None) is None:
         try:
             ts = pd.to_datetime(ts, errors="coerce").dt.tz_localize(TZ)
@@ -332,7 +324,6 @@ def normalize_realized(df: pd.DataFrame) -> pd.DataFrame:
     d["実現損益[円]"] = to_numeric_jp(d[pl_col]) if pl_col else pd.Series(dtype="float64")
 
     return normalize_symbol_cols(d)
-
 
 def normalize_yakujyou(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return df
@@ -710,28 +701,28 @@ def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     out = out.reset_index()
     return out
 
-# ======== 時間系ヘルパ ========
+# ======== 時間系ヘルパ（“秒”で比較する方式に統一） ========
 BASE_ANCHOR_DATE = datetime(2000,1,1, tzinfo=TZ)
 
 def to_time_of_day_ts(dt_series: pd.Series) -> pd.Series:
-    """時刻だけを 2000-01-01 上の Timestamp に乗せる（x軸用）"""
     dt_local = dt_series.dt.tz_convert(TZ)
     return pd.to_datetime([datetime(2000,1,1,h, m, s, tzinfo=TZ)
                            for h,m,s in zip(dt_local.dt.hour, dt_local.dt.minute, dt_local.dt.second)])
 
 def session_of(dt_series: pd.Series) -> pd.Series:
-    """前場/後場/その他（Na）を判定"""
-    t = dt_series.dt.tz_convert(TZ).dt.time
-    cond_m = (t >= MORNING_START) & (t <= MORNING_END)
-    cond_a = (t >= AFTERNOON_START) & (t <= AFTERNOON_END)
+    """前場/後場/その他（Na）を判定（秒で比較）"""
+    dt_local = dt_series.dt.tz_convert(TZ)
+    sec = dt_local.dt.hour*3600 + dt_local.dt.minute*60 + dt_local.dt.second
     out = pd.Series(pd.NA, index=dt_series.index, dtype="object")
-    out[cond_m] = "前場"; out[cond_a] = "後場"
+    out[(sec >= MORNING_START_SEC) & (sec <= MORNING_END_SEC)]  = "前場"
+    out[(sec >= AFTERNOON_START_SEC) & (sec <= AFTERNOON_END_SEC)] = "後場"
     return out
 
 def clip_market_time(dt_series: pd.Series) -> pd.Series:
-    """9:00～15:30 に入っている行だけ True"""
-    tl = dt_series.dt.tz_convert(TZ).dt.time
-    return (tl >= MORNING_START) & (tl <= AFTERNOON_END)
+    """9:00～15:30 に入っている行だけ True（秒で比較）"""
+    dt_local = dt_series.dt.tz_convert(TZ)
+    sec = dt_local.dt.hour*3600 + dt_local.dt.minute*60 + dt_local.dt.second
+    return (sec >= MORNING_START_SEC) & (sec <= AFTERNOON_END_SEC)
 
 # =========================================================
 # サイドバー：データアップロード & フィルタ
@@ -885,7 +876,7 @@ with tab1:
             fig_bar.update_layout(margin=dict(l=10,r=10,t=20,b=10), height=300, xaxis_title=label, yaxis_title="実現損益[円]")
             st.plotly_chart(fig_bar, use_container_width=True)
 
-# ---- 1b) 時間別（修正：時刻ありのみ、x軸9:00-15:30、前場/後場比較・累積勝率）
+# ---- 1b) 時間別
 with tab1b:
     st.markdown("### 実現損益（時間別・1時間ごと）")
     if realized_f.empty:
@@ -896,161 +887,152 @@ with tab1b:
         # --- 時刻がある行だけ採用 ---
         if "約定日時" not in d.columns:
             st.warning("実現損益データに '約定日時' 列がありません。サイドバーのエンコーディングや列検出をご確認ください。")
-            st.stop()
-
-        dt = pd.to_datetime(d["約定日時"], errors="coerce")
-        # TZ再保証
-        try:
-            dt = dt.dt.tz_convert(TZ)
-        except Exception:
-            dt = dt.dt.tz_localize(TZ)
-
-        # 約定時刻あり のみ
-        if "約定時刻あり" in d.columns:
-            d = d.loc[d["約定時刻あり"]].copy()
-            dt = dt.loc[d.index]
         else:
-            # フォールバック: 00:00:00 以外を採用
-            mask_has_time = dt.notna() & ((dt.dt.hour + dt.dt.minute + dt.dt.second) > 0)
-            d = d.loc[mask_has_time].copy()
+            dt = pd.to_datetime(d["約定日時"], errors="coerce")
+            try:
+                dt = dt.dt.tz_convert(TZ)
+            except Exception:
+                dt = dt.dt.tz_localize(TZ)
+
+            if "約定時刻あり" in d.columns:
+                d = d.loc[d["約定時刻あり"]].copy()
+                dt = dt.loc[d.index]
+            else:
+                mask_has_time = dt.notna() & ((dt.dt.hour + dt.dt.minute + dt.dt.second) > 0)
+                d = d.loc[mask_has_time].copy()
+                dt = dt.loc[d.index]
+
+            # 市場時間でクリップ（9:00〜15:30）— 秒で比較
+            dt_local = dt.dt.tz_convert(TZ)
+            sec = dt_local.dt.hour*3600 + dt_local.dt.minute*60 + dt_local.dt.second
+            mask_mkt = (sec >= MORNING_START_SEC) & (sec <= AFTERNOON_END_SEC)
+            d = d.loc[mask_mkt].copy()
             dt = dt.loc[d.index]
 
-        # 市場時間でクリップ（9:00〜15:30）
-        tl = dt.dt.tz_convert(TZ).dt.time
-        mask_mkt = (tl >= time(9,0)) & (tl <= time(15,30))
-        d = d.loc[mask_mkt].copy()
-        dt = dt.loc[d.index]
+            if d.empty:
+                st.info("時刻付きのレコードがありません（または市場時間外のみでした）。")
+            else:
+                # 指標列
+                d["PL"] = to_numeric_jp(d["実現損益[円]"])
+                d["win"] = d["PL"] > 0
+                d["LR"]  = d["取引"].map(lr_from_realized_trade) if "取引" in d.columns else pd.NA
 
-        if d.empty:
-            st.info("時刻付きのレコードがありません（または市場時間外のみでした）。")
-            st.stop()
+                # 1時間ビン（x軸は固定9:00〜15:30の擬似日付 2000-01-01 を使用）
+                hour_floor = dt.dt.floor("H")
+                hour_x = pd.to_datetime([datetime(2000,1,1,h.hour,0,0, tzinfo=TZ) for h in hour_floor])
+                d["hour_x"] = hour_x
 
-        # 指標列
-        d["PL"] = to_numeric_jp(d["実現損益[円]"])
-        d["win"] = d["PL"] > 0
-        d["LR"]  = d["取引"].map(lr_from_realized_trade) if "取引" in d.columns else pd.NA
+                x_range = [datetime(2000,1,1,9,0, tzinfo=TZ), datetime(2000,1,1,15,30, tzinfo=TZ)]
+                x_ticks = pd.date_range(x_range[0], x_range[1], freq="60min", inclusive="both")
+                base = pd.DataFrame({"hour_x": x_ticks})
 
-        # 1時間ビン（x軸は固定9:00〜15:30の擬似日付 2000-01-01 を使用）
-        hour_floor = dt.dt.floor("H")
-        hour_x = pd.to_datetime([datetime(2000,1,1,h.hour,0,0, tzinfo=TZ) for h in hour_floor])
-        d["hour_x"] = hour_x
+                by = d.groupby("hour_x", as_index=False).agg(
+                    収支=("PL","sum"),
+                    取引回数=("PL","count"),
+                    勝率=("win","mean"),
+                    平均損益=("PL","mean")
+                )
+                if d["LR"].notna().any():
+                    gL = d[d["LR"]=="LONG"].groupby("hour_x")["win"].mean().rename("勝率_ロング")
+                    gS = d[d["LR"]=="SHORT"].groupby("hour_x")["win"].mean().rename("勝率_ショート")
+                    by = base.merge(by, on="hour_x", how="left").merge(gL, how="left", on="hour_x").merge(gS, how="left", on="hour_x")
+                else:
+                    by = base.merge(by, on="hour_x", how="left")
+                    by["勝率_ロング"] = np.nan
+                    by["勝率_ショート"] = np.nan
 
-        x_range = [datetime(2000,1,1,9,0, tzinfo=TZ), datetime(2000,1,1,15,30, tzinfo=TZ)]
-        x_ticks = pd.date_range(x_range[0], x_range[1], freq="60min", inclusive="both")
-        base = pd.DataFrame({"hour_x": x_ticks})
+                disp = by.copy()
+                disp["時間"] = disp["hour_x"].dt.strftime("%H:%M")
+                disp["勝率"] = (disp["勝率"]*100).round(1)
+                disp["勝率_ロング"] = (disp["勝率_ロング"]*100).round(1)
+                disp["勝率_ショート"] = (disp["勝率_ショート"]*100).round(1)
+                st.dataframe(disp[["時間","収支","取引回数","勝率","勝率_ロング","勝率_ショート","平均損益"]],
+                             use_container_width=True, hide_index=True)
+                download_button_df(disp, "⬇ CSVダウンロード（時間別）", "hourly_stats.csv")
 
-        by = d.groupby("hour_x", as_index=False).agg(
-            収支=("PL","sum"),
-            取引回数=("PL","count"),
-            勝率=("win","mean"),
-            平均損益=("PL","mean")
-        )
-        if d["LR"].notna().any():
-            gL = d[d["LR"]=="LONG"].groupby("hour_x")["win"].mean().rename("勝率_ロング")
-            gS = d[d["LR"]=="SHORT"].groupby("hour_x")["win"].mean().rename("勝率_ショート")
-            by = base.merge(by, on="hour_x", how="left").merge(gL, how="left", on="hour_x").merge(gS, how="left", on="hour_x")
-        else:
-            by = base.merge(by, on="hour_x", how="left")
-            by["勝率_ロング"] = np.nan
-            by["勝率_ショート"] = np.nan
+                # グラフ
+                fig_h_pl = go.Figure([go.Bar(x=by["hour_x"], y=by["収支"], name="収支（合計）")])
+                fig_h_pl.update_layout(title="時間別 収支（合計）", xaxis_title="時間", yaxis_title="円",
+                                       margin=dict(l=10,r=10,t=30,b=10), height=300,
+                                       xaxis=dict(tickformat="%H:%M", range=x_range))
+                st.plotly_chart(fig_h_pl, use_container_width=True)
 
-        disp = by.copy()
-        disp["時間"] = disp["hour_x"].dt.strftime("%H:%M")
-        disp["勝率"] = (disp["勝率"]*100).round(1)
-        disp["勝率_ロング"] = (disp["勝率_ロング"]*100).round(1)
-        disp["勝率_ショート"] = (disp["勝率_ショート"]*100).round(1)
-        st.dataframe(disp[["時間","収支","取引回数","勝率","勝率_ロング","勝率_ショート","平均損益"]],
-                     use_container_width=True, hide_index=True)
-        download_button_df(disp, "⬇ CSVダウンロード（時間別）", "hourly_stats.csv")
+                fig_h_wr = go.Figure([go.Scatter(x=by["hour_x"], y=by["勝率"]*100, mode="lines+markers", name="勝率")])
+                fig_h_wr.update_layout(title="時間別 勝率（全体）", xaxis_title="時間", yaxis_title="勝率（%）",
+                                       margin=dict(l=10,r=10,t=30,b=10), height=300,
+                                       yaxis=dict(range=[0,100]),
+                                       xaxis=dict(tickformat="%H:%M", range=x_range))
+                st.plotly_chart(fig_h_wr, use_container_width=True)
 
-        # 収支
-        fig_h_pl = go.Figure([go.Bar(x=by["hour_x"], y=by["収支"], name="収支（合計）")])
-        fig_h_pl.update_layout(title="時間別 収支（合計）", xaxis_title="時間", yaxis_title="円",
-                               margin=dict(l=10,r=10,t=30,b=10), height=300,
-                               xaxis=dict(tickformat="%H:%M", range=x_range))
-        st.plotly_chart(fig_h_pl, use_container_width=True)
+                fig_h_lr = go.Figure()
+                fig_h_lr.add_trace(go.Scatter(x=by["hour_x"], y=by["勝率_ロング"]*100, mode="lines+markers", name="勝率（ロング）"))
+                fig_h_lr.add_trace(go.Scatter(x=by["hour_x"], y=by["勝率_ショート"]*100, mode="lines+markers", name="勝率（ショート）"))
+                fig_h_lr.update_layout(title="時間別 勝率（ロング/ショート）", xaxis_title="時間", yaxis_title="勝率（%）",
+                                       margin=dict(l=10,r=10,t=30,b=10), height=300,
+                                       yaxis=dict(range=[0,100]),
+                                       xaxis=dict(tickformat="%H:%M", range=x_range))
+                st.plotly_chart(fig_h_lr, use_container_width=True)
 
-        # 勝率（全体）
-        fig_h_wr = go.Figure([go.Scatter(x=by["hour_x"], y=by["勝率"]*100, mode="lines+markers", name="勝率")])
-        fig_h_wr.update_layout(title="時間別 勝率（全体）", xaxis_title="時間", yaxis_title="勝率（%）",
-                               margin=dict(l=10,r=10,t=30,b=10), height=300,
-                               yaxis=dict(range=[0,100]),
-                               xaxis=dict(tickformat="%H:%M", range=x_range))
-        st.plotly_chart(fig_h_wr, use_container_width=True)
+                fig_h_cnt = go.Figure([go.Bar(x=by["hour_x"], y=by["取引回数"], name="取引回数")])
+                fig_h_cnt.update_layout(title="時間別 取引回数", xaxis_title="時間", yaxis_title="回",
+                                        margin=dict(l=10,r=10,t=30,b=10), height=300,
+                                        xaxis=dict(tickformat="%H:%M", range=x_range))
+                st.plotly_chart(fig_h_cnt, use_container_width=True)
 
-        # 勝率（ロング/ショート）
-        fig_h_lr = go.Figure()
-        fig_h_lr.add_trace(go.Scatter(x=by["hour_x"], y=by["勝率_ロング"]*100, mode="lines+markers", name="勝率（ロング）"))
-        fig_h_lr.add_trace(go.Scatter(x=by["hour_x"], y=by["勝率_ショート"]*100, mode="lines+markers", name="勝率（ショート）"))
-        fig_h_lr.update_layout(title="時間別 勝率（ロング/ショート）", xaxis_title="時間", yaxis_title="勝率（%）",
-                               margin=dict(l=10,r=10,t=30,b=10), height=300,
-                               yaxis=dict(range=[0,100]),
-                               xaxis=dict(tickformat="%H:%M", range=x_range))
-        st.plotly_chart(fig_h_lr, use_container_width=True)
+                fig_h_avg = go.Figure([go.Bar(x=by["hour_x"], y=by["平均損益"], name="平均損益（/回）")])
+                fig_h_avg.update_layout(title="時間別 平均損益（/回）", xaxis_title="時間", yaxis_title="円/回",
+                                        margin=dict(l=10,r=10,t=30,b=10), height=300,
+                                        xaxis=dict(tickformat="%H:%M", range=x_range))
+                st.plotly_chart(fig_h_avg, use_container_width=True)
 
-        # 取引回数
-        fig_h_cnt = go.Figure([go.Bar(x=by["hour_x"], y=by["取引回数"], name="取引回数")])
-        fig_h_cnt.update_layout(title="時間別 取引回数", xaxis_title="時間", yaxis_title="回",
-                                margin=dict(l=10,r=10,t=30,b=10), height=300,
-                                xaxis=dict(tickformat="%H:%M", range=x_range))
-        st.plotly_chart(fig_h_cnt, use_container_width=True)
+                # 前場 / 後場 比較
+                st.markdown("### 前場 / 後場 比較")
+                ses = session_of(dt.loc[d.index])
+                d["セッション"] = ses
+                cmp = d.dropna(subset=["セッション"]).groupby("セッション").agg(
+                    収支=("PL","sum"),
+                    取引回数=("PL","count"),
+                    勝率=("win","mean"),
+                    平均損益=("PL","mean")
+                ).reset_index()
+                cmp["勝率"] = (cmp["勝率"]*100).round(1)
+                st.dataframe(cmp, use_container_width=True, hide_index=True)
+                download_button_df(cmp, "⬇ CSVダウンロード（前場後場比較）", "am_pm_compare.csv")
 
-        # 平均損益（/回）
-        fig_h_avg = go.Figure([go.Bar(x=by["hour_x"], y=by["平均損益"], name="平均損益（/回）")])
-        fig_h_avg.update_layout(title="時間別 平均損益（/回）", xaxis_title="時間", yaxis_title="円/回",
-                                margin=dict(l=10,r=10,t=30,b=10), height=300,
-                                xaxis=dict(tickformat="%H:%M", range=x_range))
-        st.plotly_chart(fig_h_avg, use_container_width=True)
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    fig_cmp_pl = go.Figure([go.Bar(x=cmp["セッション"], y=cmp["収支"], name="収支")])
+                    fig_cmp_pl.update_layout(title="前場/後場 収支", xaxis_title="", yaxis_title="円",
+                                             margin=dict(l=10,r=10,t=30,b=10), height=300)
+                    st.plotly_chart(fig_cmp_pl, use_container_width=True)
+                with cc2:
+                    fig_cmp_wr = go.Figure([go.Bar(x=cmp["セッション"], y=cmp["勝率"], name="勝率")])
+                    fig_cmp_wr.update_layout(title="前場/後場 勝率", xaxis_title="", yaxis_title="勝率（%）",
+                                             margin=dict(l=10,r=10,t=30,b=10), height=300,
+                                             yaxis=dict(range=[0,100]))
+                    st.plotly_chart(fig_cmp_wr, use_container_width=True)
 
-        # 前場 / 後場 比較
-        st.markdown("### 前場 / 後場 比較")
-        ses = session_of(dt.loc[d.index])
-        d["セッション"] = ses
-        cmp = d.dropna(subset=["セッション"]).groupby("セッション").agg(
-            収支=("PL","sum"),
-            取引回数=("PL","count"),
-            勝率=("win","mean"),
-            平均損益=("PL","mean")
-        ).reset_index()
-        cmp["勝率"] = (cmp["勝率"]*100).round(1)
-        st.dataframe(cmp, use_container_width=True, hide_index=True)
-        download_button_df(cmp, "⬇ CSVダウンロード（前場後場比較）", "am_pm_compare.csv")
+                # 累積勝率の時間推移（5分ビン）
+                st.markdown("### 累積勝率の時間推移（全期間・5分ビン）")
+                five_bin = dt.loc[d.index].dt.floor("5min")
+                x_five = pd.to_datetime([datetime(2000,1,1,t.hour,t.minute,0, tzinfo=TZ) for t in five_bin.dt.time])
+                tmp = pd.DataFrame({"x": x_five, "win": d["win"].astype(float), "cnt": 1.0})
+                grid = pd.DataFrame({"x": pd.date_range(datetime(2000,1,1,9,0, tzinfo=TZ),
+                                                        datetime(2000,1,1,15,30, tzinfo=TZ),
+                                                        freq="5min", inclusive="both")})
+                agg5 = tmp.groupby("x").agg(win_sum=("win","sum"), cnt=("cnt","sum")).reset_index()
+                grid = grid.merge(agg5, on="x", how="left").fillna(0.0)
+                grid["cum_wr"] = np.where(grid["cnt"].cumsum()>0,
+                                          grid["win_sum"].cumsum()/grid["cnt"].cumsum()*100.0, np.nan)
 
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            fig_cmp_pl = go.Figure([go.Bar(x=cmp["セッション"], y=cmp["収支"], name="収支")])
-            fig_cmp_pl.update_layout(title="前場/後場 収支", xaxis_title="", yaxis_title="円",
-                                     margin=dict(l=10,r=10,t=30,b=10), height=300)
-            st.plotly_chart(fig_cmp_pl, use_container_width=True)
-        with cc2:
-            fig_cmp_wr = go.Figure([go.Bar(x=cmp["セッション"], y=cmp["勝率"], name="勝率")])
-            fig_cmp_wr.update_layout(title="前場/後場 勝率", xaxis_title="", yaxis_title="勝率（%）",
-                                     margin=dict(l=10,r=10,t=30,b=10), height=300,
-                                     yaxis=dict(range=[0,100]))
-            st.plotly_chart(fig_cmp_wr, use_container_width=True)
-
-        # 累積勝率の時間推移（5分ビン）
-        st.markdown("### 累積勝率の時間推移（全期間・5分ビン）")
-        five_bin = dt.loc[d.index].dt.floor("5min")
-        x_five = pd.to_datetime([datetime(2000,1,1,t.hour,t.minute,0, tzinfo=TZ) for t in five_bin.dt.time])
-        tmp = pd.DataFrame({"x": x_five, "win": d["win"].astype(float), "cnt": 1.0})
-        grid = pd.DataFrame({"x": pd.date_range(datetime(2000,1,1,9,0, tzinfo=TZ),
-                                                datetime(2000,1,1,15,30, tzinfo=TZ),
-                                                freq="5min", inclusive="both")})
-        agg5 = tmp.groupby("x").agg(win_sum=("win","sum"), cnt=("cnt","sum")).reset_index()
-        grid = grid.merge(agg5, on="x", how="left").fillna(0.0)
-        grid["cum_wr"] = np.where(grid["cnt"].cumsum()>0,
-                                  grid["win_sum"].cumsum()/grid["cnt"].cumsum()*100.0, np.nan)
-
-        fig_cum = go.Figure([go.Scatter(x=grid["x"], y=grid["cum_wr"], mode="lines", name="累積勝率")])
-        fig_cum.update_layout(title="累積勝率（時間の経過とともに）", xaxis_title="時間", yaxis_title="勝率（%）",
-                              margin=dict(l=10,r=10,t=30,b=10), height=320,
-                              yaxis=dict(range=[0,100]),
-                              xaxis=dict(tickformat="%H:%M",
-                                         range=[datetime(2000,1,1,9,0, tzinfo=TZ),
-                                                datetime(2000,1,1,15,30, tzinfo=TZ)]))
-        st.plotly_chart(fig_cum, use_container_width=True)
-
+                fig_cum = go.Figure([go.Scatter(x=grid["x"], y=grid["cum_wr"], mode="lines", name="累積勝率")])
+                fig_cum.update_layout(title="累積勝率（時間の経過とともに）", xaxis_title="時間", yaxis_title="勝率（%）",
+                                      margin=dict(l=10,r=10,t=30,b=10), height=320,
+                                      yaxis=dict(range=[0,100]),
+                                      xaxis=dict(tickformat="%H:%M",
+                                                 range=[datetime(2000,1,1,9,0, tzinfo=TZ),
+                                                        datetime(2000,1,1,15,30, tzinfo=TZ)]))
+                st.plotly_chart(fig_cum, use_container_width=True)
 
 # ---- 2) 累計
 with tab2:
