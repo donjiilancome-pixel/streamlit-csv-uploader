@@ -121,6 +121,27 @@ def concat_uploaded_tables(files, sig: str, add_source_col: bool=True) -> pd.Dat
         frames.append(df)
     return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
+def _to_jst_series(obj, index) -> pd.Series:
+    """
+    obj が Series のときはそれを datetime64[ns] にして返す。
+    列が無い/スカラーの場合は、index 長の NaT Series を返す。
+    返す Series は必ず JST（TZ）を持つ。
+    """
+    if isinstance(obj, pd.Series):
+        s = pd.to_datetime(obj, errors="coerce")
+    else:
+        s = pd.Series(pd.NaT, index=index, dtype="datetime64[ns]")
+
+    # タイムゾーン付与/変換
+    if hasattr(s.dtype, "tz") and s.dtype.tz is None:
+        try:
+            s = s.dt.tz_localize(TZ)
+        except Exception:
+            s = s.dt.tz_convert(TZ)
+    elif hasattr(s.dtype, "tz"):
+        s = s.dt.tz_convert(TZ)
+    return s
+
 # =========================================================
 # 銘柄コード/名称 正規化
 # =========================================================
@@ -525,15 +546,9 @@ CODE_TO_NAME = build_code_to_name_map(realized, yakujyou_all)
 # --- 実現損益に「約定履歴から時刻を推定付与」→ 最終列を作成（★パッチ要）
 realized = attach_exec_time_from_yak(realized, yakujyou_all)
 
-dt_real = pd.to_datetime(realized.get("約定日時", pd.NaT), errors="coerce")
-if getattr(dt_real.dtype, "tz", None) is None:
-    try: dt_real = dt_real.dt.tz_localize(TZ)
-    except Exception: dt_real = dt_real.dt.tz_convert(TZ)
-
-dt_est = pd.to_datetime(realized.get("約定日時_推定", pd.NaT), errors="coerce")
-if getattr(dt_est.dtype, "tz", None) is None:
-    try: dt_est = dt_est.dt.tz_localize(TZ)
-    except Exception: dt_est = dt_est.dt.tz_convert(TZ)
+# --- 最終的に使う日時列を安全に生成 ---
+dt_real = _to_jst_series(realized["約定日時"]       if "約定日時" in realized.columns else None, realized.index)
+dt_est  = _to_jst_series(realized["約定日時_推定"]   if "約定日時_推定" in realized.columns else None, realized.index)
 
 has_real_time = dt_real.notna() & ((dt_real.dt.hour + dt_real.dt.minute + dt_real.dt.second) > 0)
 realized["約定日時_final"] = dt_real.where(has_real_time, dt_est)
@@ -676,10 +691,7 @@ with tab1b:
         if d.empty:
             st.info("実現損益の数値が見つかりません。")
         else:
-            dt_real = pd.to_datetime(d.get("約定日時_final", pd.NaT), errors="coerce")
-            if getattr(dt_real.dtype, "tz", None) is None:
-                try: dt_real = dt_real.dt.tz_localize(TZ)
-                except Exception: dt_real = dt_real.dt.tz_convert(TZ)
+            dt_real = _to_jst_series(d["約定日時_final"] if "約定日時_final" in d.columns else None, d.index)
 
             valid = dt_real.notna()
             d, dt = d.loc[valid].copy(), dt_real.loc[valid]
