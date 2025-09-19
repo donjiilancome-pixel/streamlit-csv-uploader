@@ -739,7 +739,7 @@ with tab1b:
             sec = (hh.fillna(0)*3600 + mm.fillna(0)*60 + ss.fillna(0)).astype(int)
             in_mkt = has_clock & (sec >= MORNING_START_SEC) & (sec <= AFTERNOON_END_SEC)
             cnt_mkt = int(in_mkt.sum())
-            cnt_midnight = int((dt.notna()) & ~has_clock)
+            cnt_midnight = int(((dt.notna()) & ~has_clock).sum())
             st.caption(f"⏱️ 真に時刻あり: {cnt_time}/{cnt_all} | 00:00扱い: {cnt_midnight} | 市場時間内: {cnt_mkt}/{cnt_all}")
 
             d, dt = d.loc[has_clock].copy(), dt.loc[has_clock]
