@@ -144,35 +144,28 @@ def _to_jst_series(obj, index) -> pd.Series:
 
 def pick_best_exec_time_series(df: pd.DataFrame, index=None) -> pd.Series:
     """
-    約定時刻の候補列（約定日時_final → 約定日時_推定 → 約定日時）のうち、
-    NaTでなく、かつ 00:00:00 でない時刻を優先して採用した tz-aware(JST) Series を返す。
+    約定時刻候補（約定日時_final → 約定日時_推定 → 約定日時）のうち、
+    NaTでなく かつ 00:00:00 ではない “時刻あり” を優先して埋める。
+    返り値は tz-aware(JST) の Series。
     """
-    if df is None or df.empty:
-        return pd.Series(pd.NaT, index=(index if index is not None else []), dtype="datetime64[ns, Asia/Tokyo]")
-
     idx = df.index if index is None else index
-    dt = pd.Series(pd.NaT, index=idx, dtype="datetime64[ns]")  # まずNaTで器を作る
+    # ★ 最初から tz-aware（JST）で器を作る（NaT埋め）
+    base = pd.Series(pd.NaT, index=idx, dtype="datetime64[ns, Asia/Tokyo]")
 
     def fill_from(colname: str, base: pd.Series) -> pd.Series:
-        if colname not in df.columns: 
+        if colname not in df.columns:
             return base
-        s = _to_jst_series(df[colname], df.index)
+        s = _to_jst_series(df[colname], df.index)  # 必ずJSTのtz-awareに
         has_clock = s.notna() & ((s.dt.hour + s.dt.minute + s.dt.second) > 0)
-        # まだ NaT の場所に、時刻が入っている候補だけ埋める
-        return base.where(~has_clock | base.notna(), s)
+        # ★ baseがNaT かつ sが“時刻あり”の場所だけ置換
+        return base.mask(base.isna() & has_clock, s)
 
-    # 優先順で埋める
-    dt = fill_from("約定日時_final", dt)
-    dt = fill_from("約定日時_推定", dt)
-    dt = fill_from("約定日時",     dt)
+    # 優先順で段階的に埋める
+    base = fill_from("約定日時_final", base)
+    base = fill_from("約定日時_推定", base)
+    base = fill_from("約定日時",     base)
 
-    # tz 付与
-    try:
-        dt = dt.dt.tz_localize(TZ)
-    except Exception:
-        dt = dt.dt.tz_convert(TZ)
-
-    return dt
+    return base
 
 # =========================================================
 # 銘柄コード/名称 正規化
@@ -799,10 +792,24 @@ with tab1b:
         if d0.empty:
             st.info("実現損益の数値が見つかりません。")
         else:
-            # ✅ 時刻の“ベスト候補”を自動選択（final → 推定 → 元の約定日時）
+            # ✅ final→推定→元 の順で“時刻あり”だけを採用（JST, tz-aware）
             dt0 = pick_best_exec_time_series(d0, index=d0.index)
 
-            # 「時刻あり」= NaTでなく、かつ 00:00:00 ではない
+            # 診断：各候補列で“時刻あり”は何件？
+            def count_has_clock(col):
+                if col not in d0.columns: return 0
+                s = _to_jst_series(d0[col], d0.index)
+                return int((s.notna() & ((s.dt.hour + s.dt.minute + s.dt.second) > 0)).sum())
+
+            with st.expander("🧪 時間別 集計の診断", expanded=False):
+                st.write("候補別“時刻あり”件数：",
+                         {"約定日時_final": count_has_clock("約定日時_final"),
+                          "約定日時_推定": count_has_clock("約定日時_推定"),
+                          "約定日時":     count_has_clock("約定日時")})
+                st.write("dt0 サンプル（先頭5件）:")
+                st.write(pd.DataFrame({"dt0": dt0}).head())
+
+            # 「真に時刻あり」= NaTでなく、かつ 00:00:00 ではない
             hh0, mm0, ss0 = dt0.dt.hour, dt0.dt.minute, dt0.dt.second
             has_clock0 = dt0.notna() & ((hh0.fillna(0)*3600 + mm0.fillna(0)*60 + ss0.fillna(0)) > 0)
 
@@ -811,7 +818,7 @@ with tab1b:
             cnt_midnight = int(((dt0.notna()) & ~has_clock0).sum())
             st.caption(f"⏱️ 真に時刻あり: {cnt_time}/{cnt_all} | 00:00扱い: {cnt_midnight}")
 
-            # ① 約定時刻なしを除外（デフォルトON）
+            # ここから先（約定時刻なしを除外・市場時間外含む/除外・集計〜可視化）は既存のままでOK
             if drop_noclock:
                 d, dt = d0.loc[has_clock0].copy(), dt0.loc[has_clock0]
             else:
@@ -820,7 +827,6 @@ with tab1b:
             if d.empty:
                 st.info("“約定時刻あり”のレコードがありません（00:00やNaTは除外）。")
             else:
-                # ② 市場時間フィルタ（オプション）
                 if include_off_hours:
                     d_in, dt_in = d, dt
                     info_suffix = "（市場時間外も含む）"
@@ -859,7 +865,6 @@ with tab1b:
                                  use_container_width=True, hide_index=True)
                     download_button_df(disp, "⬇ CSVダウンロード（時間別）", "hourly_stats.csv")
 
-                    # グラフ
                     fig_h_pl = go.Figure([go.Bar(x=by["hour_x"], y=by["収支"], name="収支（合計）")])
                     fig_h_pl.update_layout(title=f"時間別 収支（合計）{info_suffix}", xaxis_title="時間", yaxis_title="円",
                                            margin=dict(l=10,r=10,t=30,b=10), height=300,
@@ -885,7 +890,6 @@ with tab1b:
                                             xaxis=dict(tickformat="%H:%M", range=x_range))
                     st.plotly_chart(fig_h_avg, use_container_width=True)
 
-                    # 前場 / 後場 比較
                     st.markdown("### 前場 / 後場 比較" + info_suffix)
                     ses = session_of(dt_in)
                     d_in["セッション"] = ses
@@ -897,7 +901,6 @@ with tab1b:
                     st.dataframe(cmp, use_container_width=True, hide_index=True)
                     download_button_df(cmp, "⬇ CSVダウンロード（前場後場比較）", "am_pm_compare.csv")
 
-                    # 累積勝率（5分）
                     st.markdown("### 累積勝率の時間推移（全期間・5分ビン）" + info_suffix)
                     five = dt_in.dt.floor("5min")
                     x_five = pd.to_datetime([datetime(2000,1,1,t.hour,t.minute,0, tzinfo=TZ) for t in five.dt.time])
