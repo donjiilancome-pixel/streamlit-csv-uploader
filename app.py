@@ -142,6 +142,38 @@ def _to_jst_series(obj, index) -> pd.Series:
     s = pd.to_datetime(s, errors="coerce")
     return s.dt.tz_localize(TZ)
 
+def pick_best_exec_time_series(df: pd.DataFrame, index=None) -> pd.Series:
+    """
+    約定時刻の候補列（約定日時_final → 約定日時_推定 → 約定日時）のうち、
+    NaTでなく、かつ 00:00:00 でない時刻を優先して採用した tz-aware(JST) Series を返す。
+    """
+    if df is None or df.empty:
+        return pd.Series(pd.NaT, index=(index if index is not None else []), dtype="datetime64[ns, Asia/Tokyo]")
+
+    idx = df.index if index is None else index
+    dt = pd.Series(pd.NaT, index=idx, dtype="datetime64[ns]")  # まずNaTで器を作る
+
+    def fill_from(colname: str, base: pd.Series) -> pd.Series:
+        if colname not in df.columns: 
+            return base
+        s = _to_jst_series(df[colname], df.index)
+        has_clock = s.notna() & ((s.dt.hour + s.dt.minute + s.dt.second) > 0)
+        # まだ NaT の場所に、時刻が入っている候補だけ埋める
+        return base.where(~has_clock | base.notna(), s)
+
+    # 優先順で埋める
+    dt = fill_from("約定日時_final", dt)
+    dt = fill_from("約定日時_推定", dt)
+    dt = fill_from("約定日時",     dt)
+
+    # tz 付与
+    try:
+        dt = dt.dt.tz_localize(TZ)
+    except Exception:
+        dt = dt.dt.tz_convert(TZ)
+
+    return dt
+
 # =========================================================
 # 銘柄コード/名称 正規化
 # =========================================================
@@ -767,15 +799,15 @@ with tab1b:
         if d0.empty:
             st.info("実現損益の数値が見つかりません。")
         else:
-            # 約定日時（最終列）→ JST Series
-            dt0 = _to_jst_series(d0["約定日時_final"] if "約定日時_final" in d0.columns else None, d0.index)
+            # ✅ 時刻の“ベスト候補”を自動選択（final → 推定 → 元の約定日時）
+            dt0 = pick_best_exec_time_series(d0, index=d0.index)
 
             # 「時刻あり」= NaTでなく、かつ 00:00:00 ではない
             hh0, mm0, ss0 = dt0.dt.hour, dt0.dt.minute, dt0.dt.second
             has_clock0 = dt0.notna() & ((hh0.fillna(0)*3600 + mm0.fillna(0)*60 + ss0.fillna(0)) > 0)
 
-            cnt_all  = len(d0)
-            cnt_time = int(has_clock0.sum())
+            cnt_all      = len(d0)
+            cnt_time     = int(has_clock0.sum())
             cnt_midnight = int(((dt0.notna()) & ~has_clock0).sum())
             st.caption(f"⏱️ 真に時刻あり: {cnt_time}/{cnt_all} | 00:00扱い: {cnt_midnight}")
 
@@ -798,11 +830,10 @@ with tab1b:
                     d_in, dt_in = d.loc[mask_mkt].copy(), dt.loc[mask_mkt]
                     info_suffix = ""
 
-                # ここから集計
                 if d_in.empty:
                     st.info("市場時間内の“約定時刻あり”レコードがありませんでした。" + ("（オプションで市場時間外を含められます）" if not include_off_hours else ""))
                 else:
-                    d_in["PL"] = to_numeric_jp(d_in["実現損益[円]"])
+                    d_in["PL"]  = to_numeric_jp(d_in["実現損益[円]"])
                     d_in["win"] = d_in["PL"] > 0
 
                     hour_floor = dt_in.dt.floor("H")
