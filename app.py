@@ -167,6 +167,31 @@ def pick_best_exec_time_series(df: pd.DataFrame, index=None) -> pd.Series:
 
     return base
 
+def pick_dt_with_optional_time(df: pd.DataFrame, dt_candidates=None, tm_candidates=None) -> pd.Series:
+    """
+    df から『約定日(等)』と『約定時間(等)』を検出し、あれば結合して tz-aware(JST) を返す。
+    - 日付のみでも、列内に "2025/09/19 09:35" や "09:35:15" 等が含まれていれば拾う
+    - 何も無ければ NaT（JST）を返す
+    """
+    if df is None or df.empty:
+        return pd.Series(pd.NaT, index=[], dtype="datetime64[ns, Asia/Tokyo]")
+
+    dtcol = pick_dt_col(df, preferred=dt_candidates)
+    tmcol = pick_time_col(df, preferred=tm_candidates)
+
+    if dtcol and tmcol and (tmcol in df.columns):
+        # 明示的に 日付＋時刻 列がある → 確実に結合
+        ts = combine_date_time_cols(df, dtcol, tmcol)  # 返り値は tz-aware(JST)
+        return ts
+
+    if dtcol:
+        # 日付列の中に時刻が混ざっているパターンも含めて解析
+        ts = parse_datetime_from_dtcol(df, dtcol)      # 返り値は tz-aware(JST)
+        return ts
+
+    # どれも無い → 全部NaT（JST）
+    return _to_jst_series(pd.Series(pd.NaT, index=df.index), df.index)
+
 # =========================================================
 # 銘柄コード/名称 正規化
 # =========================================================
@@ -365,24 +390,15 @@ def attach_exec_time_from_yak(realized_df: pd.DataFrame, yak_df: pd.DataFrame) -
     『価格差＋数量差』最小の時刻を '約定日時_推定' に入れる。既に時刻ありならスキップ。
     """
     if realized_df.empty or yak_df.empty:
+        realized_df = realized_df.copy()
         realized_df["約定日時_推定"] = pd.NaT
         return realized_df
 
     d = realized_df.copy()
     y = normalize_symbol_cols(clean_columns(yak_df.copy()))
 
-    y_dtcol = pick_dt_col(y) or "約定日"
-    if y_dtcol in y.columns:
-        try:
-            y["約定日時"] = pd.to_datetime(y[y_dtcol], errors="coerce", infer_datetime_format=True)
-        except Exception:
-            pat = y[y_dtcol].astype(str).str.replace("：",":", regex=False)
-            y["約定日時"] = pd.to_datetime(pat, errors="coerce", infer_datetime_format=True)
-    else:
-        y["約定日時"] = pd.NaT
-
-    # JSTへ
-    y["約定日時"] = _to_jst_series(y["約定日時"], y.index)
+    # 🔴 修正：yak の『約定日＋約定時間』を結合して tz-aware(JST) へ
+    y["約定日時"] = pick_dt_with_optional_time(y)
 
     y["__day__"]   = y["約定日時"].dt.date
     # 列名探索
@@ -399,7 +415,7 @@ def attach_exec_time_from_yak(realized_df: pd.DataFrame, yak_df: pd.DataFrame) -
     y["__qty__"]    = to_numeric_jp(y[qty_col])   if qty_col else np.nan
     y["__action__"] = y[side_col] if side_col else pd.NA
 
-    d["__day__"] = pd.to_datetime(d["約定日"], errors="coerce").dt.date
+    d["__day__"] = pd.to_datetime(d.get("約定日", d.get("約定日_final")), errors="coerce").dt.date
     y_grp = y.groupby(["__day__","code_key","__action__"])
 
     est = []
@@ -414,7 +430,7 @@ def attach_exec_time_from_yak(realized_df: pd.DataFrame, yak_df: pd.DataFrame) -
         if key not in y_grp.groups:
             est.append(pd.NaT); continue
         g = y_grp.get_group(key)
-        if g.empty:
+        if g.empty or g["約定日時"].isna().all():
             est.append(pd.NaT); continue
 
         tp = row.get("__決済単価__", np.nan)
@@ -446,29 +462,18 @@ def enrich_times_lenient(realized_df: pd.DataFrame, yak_df: pd.DataFrame) -> pd.
     if not no_time.any():
         return d
 
-    # 基準日 Series を安全に作る
+    # 基準日 Series
     if "約定日_final" in d.columns:
         day_base = pd.to_datetime(d["約定日_final"], errors="coerce")
     elif "約定日" in d.columns:
         day_base = pd.to_datetime(d["約定日"], errors="coerce")
     else:
-        if "約定日時_final" in d.columns:
-            day_base = _to_jst_series(d["約定日時_final"], d.index)
-        elif "約定日時" in d.columns:
-            day_base = _to_jst_series(d["約定日時"], d.index)
-        elif "約定日時_推定" in d.columns:
-            day_base = _to_jst_series(d["約定日時_推定"], d.index)
-        else:
-            day_base = pd.Series(pd.NaT, index=d.index, dtype="datetime64[ns, Asia/Tokyo]")
-    if hasattr(day_base.dtype, "tz"):
-        d["__day__"] = day_base.dt.date
-    else:
-        d["__day__"] = pd.to_datetime(day_base, errors="coerce").dt.date
+        day_base = _to_jst_series(d.get("約定日時_final", pd.Series(pd.NaT, index=d.index)), d.index)
+    d["__day__"] = (day_base.dt.tz_convert(TZ) if hasattr(day_base.dtype, "tz") else pd.to_datetime(day_base, errors="coerce")).dt.date
 
-    # 約定履歴から代表時刻（同一日×code/name/全体）
+    # 🔴 修正：yak の「日付＋時刻」を必ず結合してから代表時刻を作る
     y = normalize_symbol_cols(clean_columns(yak_df.copy()))
-    y_dtcol = pick_dt_col(y) or "約定日"
-    y_dt = _to_jst_series(y[y_dtcol] if y_dtcol in y.columns else None, y.index)
+    y_dt = pick_dt_with_optional_time(y)
     y = y.assign(__day__=y_dt.dt.date, __dt__=y_dt)
 
     base = y.dropna(subset=["__dt__"]).copy()
@@ -476,24 +481,18 @@ def enrich_times_lenient(realized_df: pd.DataFrame, yak_df: pd.DataFrame) -> pd.
         d["約定日時_final"] = dt_final
         return d
 
-    # ① 同一日×code_key
     rep_code = (base.dropna(subset=["code_key"])
                     .groupby(["__day__","code_key"])["__dt__"]
                     .apply(lambda s: s.sort_values().iloc[len(s)//2])
                     .rename("__rep_dt_code__"))
-
-    # ② 同一日×name_key
     rep_name = (base.dropna(subset=["name_key"])
                     .groupby(["__day__","name_key"])["__dt__"]
                     .apply(lambda s: s.sort_values().iloc[len(s)//2])
                     .rename("__rep_dt_name__"))
-
-    # ③ 同一日 全体
     rep_day = (base.groupby(["__day__"])["__dt__"]
                     .apply(lambda s: s.sort_values().iloc[len(s)//2])
                     .rename("__rep_dt_day__"))
 
-    # 段階的にマージして補完
     d["__ck__"] = d.get("code_key", pd.Series([""]*len(d), index=d.index)).astype(str).str.upper()
     d["__nk__"] = d.get("name_key", pd.Series([""]*len(d), index=d.index)).astype(str)
 
