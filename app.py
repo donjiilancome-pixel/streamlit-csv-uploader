@@ -488,11 +488,12 @@ with tab4:
             sym = pd.Series(["N/A"]*len(base), index=base.index)
         base = base.assign(symbol=sym)
 
-        by_symbol = base.groupby("symbol").agg(
-            実現損益合計=("pl","sum"),
-            取引回数=("pl","count"),
-            1回平均損益=("pl","mean"),
-        ).reset_index().sort_values("実現損益合計", ascending=False)
+        named_aggs = {
+            "実現損益合計": ("pl", "sum"),
+            "取引回数": ("pl", "count"),
+            "1回平均損益": ("pl", "mean"),  # ← 先頭が数字でもOK（辞書展開）
+        }
+        by_symbol = base.groupby("symbol").agg(**named_aggs).reset_index().sort_values("実現損益合計", ascending=False)
 
         by_symbol = _numify_cols(by_symbol, ["実現損益合計","1回平均損益","取引回数"], round0=True)
 
