@@ -1039,8 +1039,7 @@ def _nearest_pos_by_ns(idx: pd.DatetimeIndex, t0: pd.Timestamp) -> int:
         idx = idx.tz_localize(TZ)
     if t0.tzinfo is None:
         t0 = t0.tz_localize(TZ)
-    # Pandas 互換性のため asi8 を使用（int64 ns）
-    idx_ns = idx.asi8
+    idx_ns = idx.asi8  # int64 ns
     t0_ns  = int(pd.Timestamp(t0).value)
     dist = np.abs(idx_ns - t0_ns)
     return int(dist.argmin())
@@ -1059,10 +1058,12 @@ def align_trades_to_ohlc(ohlc: pd.DataFrame, trades: pd.DataFrame, max_gap_min=6
     side_col  = next((c for c in ["売買","売買区分","売買種別","Side","取引"] if c in tdf.columns), None)
     if price_col is None:
         for c in tdf.columns:
-            if re.search(r"(約定)?.*(単価|価格)", str(c)): price_col = c; break
+            if re.search(r"(約定)?.*(単価|価格)", str(c)):
+                price_col = c; break
     if qty_col is None:
         for c in tdf.columns:
-            if any(k in str(c) for k in ["数量","株数","口数","出来高"]): qty_col = c; break
+            if any(k in str(c) for k in ["数量","株数","口数","出来高"]):
+                qty_col = c; break
 
     tdf["price"] = to_numeric_jp(tdf[price_col]) if price_col else np.nan
     tdf["qty"]   = to_numeric_jp(tdf[qty_col])   if qty_col else np.nan
@@ -1083,7 +1084,6 @@ def align_trades_to_ohlc(ohlc: pd.DataFrame, trades: pd.DataFrame, max_gap_min=6
 
     tdf["label4"] = tdf["side"].map(classify_side4)
 
-    # OHLC の index を JST の DatetimeIndex にしてソート
     odf = ohlc.copy()
     tt = _to_jst_series(odf["time"], odf.index)
     odf = odf.set_index(tt).sort_index()
@@ -1098,7 +1098,6 @@ def align_trades_to_ohlc(ohlc: pd.DataFrame, trades: pd.DataFrame, max_gap_min=6
         window = odf.loc[lo:hi]
         if window.empty:
             continue
-        # ns 差の argmin で最近傍を取得
         pos = _nearest_pos_by_ns(window.index, t0)
         near_time = window.index[pos]
         price_on_bar = window.loc[near_time, "close"]
@@ -1146,13 +1145,15 @@ with tab5:
         if dmin is None or dmax is None:
             st.info("有効な日時列が見つかりませんでした。")
         else:
-            # ✅ 初期値を「当日(JST)」に。範囲外ならクランプ
+            # 初期値を「当日(JST)」に。範囲外ならクランプ
             today_jst = datetime.now(TZ).date()
             default_day = today_jst
-            if dmin and default_day < dmin: default_day = dmin
-            if dmax and default_day > dmax: default_day = dmax
+            if dmin and default_day < dmin:
+                default_day = dmin
+            if dmax and default_day > dmax:
+                default_day = dmax
 
-            c1, c2, c3 = st.columns([2,2,1])
+            c1, c2, c3 = st.columns([2, 2, 1])
             with c1:
                 sel_date = st.date_input("表示日を選択", value=default_day, min_value=dmin, max_value=dmax)
             with c2:
@@ -1165,7 +1166,7 @@ with tab5:
             t1 = pd.Timestamp(f"{sel_date} 15:30", tz=TZ)
             x_range = [t0, t1]
 
-            # ✅ 選択日の約定表（全銘柄）を表示
+            # 選択日の約定表（全銘柄）
             st.markdown("#### 約定表（選択日・全銘柄）")
             if yakujyou_all is None or yakujyou_all.empty:
                 st.info("約定履歴が未アップロードです。")
@@ -1174,36 +1175,36 @@ with tab5:
                 y_dtcol = pick_dt_col(yak_day_all) or "約定日"
                 yak_day_all["約定日時"] = pick_dt_with_optional_time(yak_day_all) if y_dtcol in yak_day_all.columns else _to_jst_series(pd.Series(pd.NaT, index=yak_day_all.index), yak_day_all.index)
                 yak_day_all = yak_day_all[yak_day_all["約定日時"].notna()]
-                yak_day_all = yak_day_all[(yak_day_all["約定日時"]>=t0) & (yak_day_all["約定日時"]<=t1)].copy()
+                yak_day_all = yak_day_all[(yak_day_all["約定日時"] >= t0) & (yak_day_all["約定日時"] <= t1)].copy()
 
                 if yak_day_all.empty:
                     st.info(f"{sel_date} の市場時間内に約定はありません。")
                 else:
-                    # 列検出（価格・数量・売買）
                     price_col = next((c for c in ["約定単価(円)","約定単価（円）","約定価格","価格","約定単価"] if c in yak_day_all.columns), None)
                     if price_col is None:
                         for c in yak_day_all.columns:
-                            if re.search(r"(約定)?.*(単価|価格)", str(c)): price_col = c; break
-                    qty_col   = next((c for c in ["約定数量(株/口)","約定数量","出来数量","数量","株数","出来高","口数"] if c in yak_day_all.columns), None)
+                            if re.search(r"(約定)?.*(単価|価格)", str(c)):
+                                price_col = c; break
+                    qty_col = next((c for c in ["約定数量(株/口)","約定数量","出来数量","数量","株数","出来高","口数"] if c in yak_day_all.columns), None)
                     if qty_col is None:
                         for c in yak_day_all.columns:
-                            if any(k in str(c) for k in ["数量","株数","口数","出来高"]): qty_col = c; break
-                    side_col  = next((c for c in ["売買","売買区分","売買種別","Side","取引"] if c in yak_day_all.columns), None)
+                            if any(k in str(c) for k in ["数量","株数","口数","出来高"]):
+                                qty_col = c; break
+                    side_col = next((c for c in ["売買","売買区分","売買種別","Side","取引"] if c in yak_day_all.columns), None)
 
                     disp = pd.DataFrame({
                         "時刻": yak_day_all["約定日時"].dt.strftime("%H:%M:%S"),
-                        "銘柄名": yak_day_all.get("name_key", pd.Series([""]*len(yak_day_all), index=yak_day_all.index)),
-                        "銘柄コード": yak_day_all.get("code_key", pd.Series([""]*len(yak_day_all), index=yak_day_all.index)),
+                        "銘柄名": yak_day_all.get("name_key", pd.Series([""] * len(yak_day_all), index=yak_day_all.index)),
+                        "銘柄コード": yak_day_all.get("code_key", pd.Series([""] * len(yak_day_all), index=yak_day_all.index)),
                         "売買": yak_day_all[side_col] if side_col else "",
                         "価格": to_numeric_jp(yak_day_all[price_col]) if price_col else np.nan,
                         "数量": to_numeric_jp(yak_day_all[qty_col]) if qty_col else np.nan,
                     }).sort_values("時刻")
 
-                    # ✅ dtype を「数値のまま」保つ（= ユーザー側で数値ソート可）
+                    # ✅ 数値のまま表示（数値ソート可）＋見た目はカンマ書式
                     disp["価格"] = pd.to_numeric(disp["価格"], errors="coerce").round(0)
                     disp["数量"] = pd.to_numeric(disp["数量"], errors="coerce")
-                    
-                    # 表示は column_config でカンマ区切りに（dtype は数値のまま）
+
                     st.dataframe(
                         disp,
                         use_container_width=True,
@@ -1211,18 +1212,16 @@ with tab5:
                         column_config={
                             "価格": st.column_config.NumberColumn("価格", format="%,.0f"),
                             "数量": st.column_config.NumberColumn("数量", format="%,d"),
-                        }
+                        },
                     )
-
-# ダウンロードは「数値のまま」出力（並び替え/再計算で便利）
-download_button_df(disp, f"⬇ CSVダウンロード（約定表 {sel_date}）", f"fills_{sel_date}.csv")
+                    download_button_df(disp, f"⬇ CSVダウンロード（約定表 {sel_date}）", f"fills_{sel_date}.csv")
 
             # 選択日のデータがある銘柄（ファイルキー）だけを提示
             keys_that_day = []
             for k, df in ohlc_map.items():
                 if df is None or df.empty:
                     continue
-                vw = df[(df["time"]>=t0) & (df["time"]<=t1)]
+                vw = df[(df["time"] >= t0) & (df["time"] <= t1)]
                 if not vw.empty:
                     keys_that_day.append(k)
 
@@ -1241,7 +1240,7 @@ download_button_df(disp, f"⬇ CSVダウンロード（約定表 {sel_date}）",
                     st.caption(f"想定銘柄名: **{sel_name}**")
 
                 view = ohlc_map[sel_key]
-                view = view[(view["time"]>=t0) & (view["time"]<=t1)].copy()
+                view = view[(view["time"] >= t0) & (view["time"] <= t1)].copy()
                 if view.empty:
                     st.info(f"{sel_key}：{sel_date} の3分足が見つかりません。")
                 else:
@@ -1250,12 +1249,12 @@ download_button_df(disp, f"⬇ CSVダウンロード（約定表 {sel_date}）",
                     if "code_key" in yak.columns:
                         this_code = extract_code_from_ohlc_key(sel_key) or ""
                         if this_code:
-                            yak = yak[yak["code_key"].astype(str).str.upper()==this_code.upper()]
+                            yak = yak[yak["code_key"].astype(str).str.upper() == this_code.upper()]
                     y_dtcol = pick_dt_col(yak) or "約定日"
                     yak = yak.copy()
                     yak["約定日時"] = pick_dt_with_optional_time(yak) if y_dtcol in yak.columns else _to_jst_series(pd.Series(pd.NaT, index=yak.index), yak.index)
                     yak = yak[yak["約定日時"].notna()]
-                    yak = yak[(yak["約定日時"]>=t0) & (yak["約定日時"]<=t1)]
+                    yak = yak[(yak["約定日時"] >= t0) & (yak["約定日時"] <= t1)]
 
                     # 近傍バーへスナップ（買建/売建/売埋/買埋）— ns差で安全に検索
                     trades = align_trades_to_ohlc(view, yak, max_gap_min=6) if not yak.empty else pd.DataFrame(columns=["time","price","side","qty","label4"])
@@ -1283,36 +1282,36 @@ download_button_df(disp, f"⬇ CSVダウンロード（約定表 {sel_date}）",
 
                     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
 
-                # 同日の下に：日経先物 / 日経平均（時間レンジ固定・サイズ統一）
-                fut_keys = [k for k in keys_that_day if ("NK2251" in k or "OSE_NK2251" in k)]
-                idx_keys = [k for k in keys_that_day if ("NI225" in k or "TVC_NI225" in k)]
+            # 同日の下に：日経先物 / 日経平均（時間レンジ固定・サイズ統一）
+            fut_keys = [k for k in keys_that_day if ("NK2251" in k or "OSE_NK2251" in k)]
+            idx_keys = [k for k in keys_that_day if ("NI225" in k or "TVC_NI225" in k)]
 
-                st.markdown("#### 日経先物（NK225mini等）")
-                if fut_keys:
-                    k = fut_keys[0]
-                    df = ohlc_map.get(k)
-                    vw = df[(df["time"]>=t0) & (df["time"]<=t1)].copy()
-                    if not vw.empty:
-                        nm = guess_name_for_ohlc_key(k, CODE_TO_NAME)
-                        ttl = f"{nm} [{k}]" if nm else k
-                        figx = make_candle_with_indicators(vw, title=ttl, height=ht, x_range=x_range)
-                        st.plotly_chart(figx, use_container_width=True, config={"displayModeBar": True})
-                    else:
-                        st.info(f"{k}：{sel_date} のデータなし。")
+            st.markdown("#### 日経先物（NK225mini等）")
+            if fut_keys:
+                k = fut_keys[0]
+                df = ohlc_map.get(k)
+                vw = df[(df["time"] >= t0) & (df["time"] <= t1)].copy()
+                if not vw.empty:
+                    nm = guess_name_for_ohlc_key(k, CODE_TO_NAME)
+                    ttl = f"{nm} [{k}]" if nm else k
+                    figx = make_candle_with_indicators(vw, title=ttl, height=ht, x_range=x_range)
+                    st.plotly_chart(figx, use_container_width=True, config={"displayModeBar": True})
                 else:
-                    st.info("日経先物（`OSE_NK2251!` など）が見つかりません。")
+                    st.info(f"{k}：{sel_date} のデータなし。")
+            else:
+                st.info("日経先物（`OSE_NK2251!` など）が見つかりません。")
 
-                st.markdown("#### 日経平均")
-                if idx_keys:
-                    k = idx_keys[0]
-                    df = ohlc_map.get(k)
-                    vw = df[(df["time"]>=t0) & (df["time"]<=t1)].copy()
-                    if not vw.empty:
-                        nm = guess_name_for_ohlc_key(k, CODE_TO_NAME)
-                        ttl = f"{nm} [{k}]" if nm else k
-                        figx = make_candle_with_indicators(vw, title=ttl, height=ht, x_range=x_range)
-                        st.plotly_chart(figx, use_container_width=True, config={"displayModeBar": True})
-                    else:
-                        st.info(f"{k}：{sel_date} のデータなし。")
+            st.markdown("#### 日経平均")
+            if idx_keys:
+                k = idx_keys[0]
+                df = ohlc_map.get(k)
+                vw = df[(df["time"] >= t0) & (df["time"] <= t1)].copy()
+                if not vw.empty:
+                    nm = guess_name_for_ohlc_key(k, CODE_TO_NAME)
+                    ttl = f"{nm} [{k}]" if nm else k
+                    figx = make_candle_with_indicators(vw, title=ttl, height=ht, x_range=x_range)
+                    st.plotly_chart(figx, use_container_width=True, config={"displayModeBar": True})
                 else:
-                    st.info("日経平均（`TVC_NI225` など）が見つかりません。")
+                    st.info(f"{k}：{sel_date} のデータなし。")
+            else:
+                st.info("日経平均（`TVC_NI225` など）が見つかりません。")
