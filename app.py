@@ -1022,10 +1022,30 @@ with tab4:
 # =========================================================
 # 5) 3分足 IN/OUT + 指標（先に日付を選び、その日にデータがある銘柄だけ選択）
 # =========================================================
+
+# --- 既に定義済みであれば再定義しないヘルパー ---
+try:
+    guess_name_for_ohlc_key
+except NameError:
+    def guess_name_for_ohlc_key(key: str, code_to_name: dict) -> str | None:
+        code = extract_code_from_ohlc_key(key)
+        name = None
+        if code:
+            name = code_to_name.get(str(code).upper())
+        if not name:
+            ku = key.upper()
+            if "NK2251" in ku or "OSE_NK2251" in ku:
+                name = "日経225先物"
+            elif "NI225" in ku or "TVC_NI225" in ku:
+                name = "日経平均"
+        return name
+
+# --- IN/OUTを4分類（買建/売建/売埋/買埋）で近傍バーへスナップ ---
 def align_trades_to_ohlc(ohlc: pd.DataFrame, trades: pd.DataFrame, max_gap_min=6):
-    """約定（IN/OUT）をOHLCの最も近いバーに結びつける。"""
+    """約定（買建/売建/売埋/買埋）をOHLCの最も近いバーに結びつける。"""
     if ohlc is None or ohlc.empty or trades is None or trades.empty:
-        return pd.DataFrame(columns=["time","price","side","qty","kind"])
+        return pd.DataFrame(columns=["time","price","side","qty","label4"])
+
     tdf = trades.copy()
     tdf["約定日時"] = _to_jst_series(tdf["約定日時"] if "約定日時" in tdf.columns else None, tdf.index)
 
@@ -1043,13 +1063,20 @@ def align_trades_to_ohlc(ohlc: pd.DataFrame, trades: pd.DataFrame, max_gap_min=6
     tdf["qty"]   = to_numeric_jp(tdf[qty_col])   if qty_col else np.nan
     tdf["side"]  = tdf[side_col].astype(str) if side_col else ""
 
-    def kind_from_side(s: str):
-        if "買建" in s or ("買" in s and "新規" in s): return "IN"
-        if "売建" in s or ("売" in s and "新規" in s): return "IN"
-        if "買埋" in s or ("買" in s and "返済" in s): return "OUT"
-        if "売埋" in s or ("売" in s and "返済" in s): return "OUT"
-        return "OTHER"
-    tdf["kind"] = tdf["side"].map(kind_from_side)
+    def classify_side4(s: str) -> str | None:
+        s = str(s)
+        if "買建" in s: return "買建"
+        if "売建" in s: return "売建"
+        if "売埋" in s: return "売埋"
+        if "買埋" in s: return "買埋"
+        # 英語・記号のヒューリスティック
+        if ("買" in s and ("新規" in s or "建" in s)) or re.search(r"\bBUY\b.*\b(OPEN|NEW)\b", s, re.I): return "買建"
+        if ("売" in s and ("新規" in s or "建" in s)) or re.search(r"\bSELL\b.*\b(OPEN|NEW)\b", s, re.I): return "売建"
+        if ("売" in s and ("返済" in s or "決済" in s)) or re.search(r"\bSELL\b.*\b(CLOSE)\b", s, re.I): return "売埋"
+        if ("買" in s and ("返済" in s or "決済" in s)) or re.search(r"\bBUY\b.*\b(CLOSE|COVER)\b", s, re.I): return "買埋"
+        return None
+
+    tdf["label4"] = tdf["side"].map(classify_side4)
 
     odf = ohlc.copy()
     tt = _to_jst_series(odf["time"], odf.index)
@@ -1058,35 +1085,48 @@ def align_trades_to_ohlc(ohlc: pd.DataFrame, trades: pd.DataFrame, max_gap_min=6
     out_rows = []
     for _, row in tdf.iterrows():
         t0 = row["約定日時"]
-        if pd.isna(t0): continue
+        if pd.isna(t0) or not row.get("label4"):
+            continue
         lo = t0 - pd.Timedelta(minutes=max_gap_min)
         hi = t0 + pd.Timedelta(minutes=max_gap_min)
         window = odf.loc[lo:hi]
-        if window.empty: continue
+        if window.empty:
+            continue
         idx = (window.index - t0).abs().argmin()
         near_time = window.index[idx]
         price_on_bar = window.loc[near_time, "close"]
-        out_rows.append({"time": near_time, "price": price_on_bar, "side": row["side"], "qty": row["qty"], "kind": row["kind"]})
-    out = pd.DataFrame(out_rows)
-    return out
+        out_rows.append({
+            "time": near_time, "price": price_on_bar,
+            "side": row["side"], "qty": row["qty"], "label4": row["label4"]
+        })
+    return pd.DataFrame(out_rows)
 
-def make_candle_with_indicators(df: pd.DataFrame, title="", height=560):
+# --- ローソク＋指標（時間レンジ＆高さを外から指定可） ---
+def make_candle_with_indicators(df: pd.DataFrame, title="", height=560, x_range=None):
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df["time"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-                                 name="OHLC", showlegend=False))
-    # 指標
+    fig.add_trace(go.Candlestick(
+        x=df["time"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+        name="OHLC", showlegend=False
+    ))
     if "VWAP" in df.columns and df["VWAP"].notna().any():
-        fig.add_trace(go.Scatter(x=df["time"], y=df["VWAP"], name="VWAP", mode="lines", line=dict(color=COLOR_VWAP, width=1.3)))
+        fig.add_trace(go.Scatter(x=df["time"], y=df["VWAP"], name="VWAP", mode="lines",
+                                 line=dict(color=COLOR_VWAP, width=1.3)))
     if "MA1" in df.columns and df["MA1"].notna().any():
-        fig.add_trace(go.Scatter(x=df["time"], y=df["MA1"], name="MA1", mode="lines", line=dict(color=COLOR_MA1, width=1.3)))
+        fig.add_trace(go.Scatter(x=df["time"], y=df["MA1"], name="MA1", mode="lines",
+                                 line=dict(color=COLOR_MA1, width=1.3)))
     if "MA2" in df.columns and df["MA2"].notna().any():
-        fig.add_trace(go.Scatter(x=df["time"], y=df["MA2"], name="MA2", mode="lines", line=dict(color=COLOR_MA2, width=1.3)))
+        fig.add_trace(go.Scatter(x=df["time"], y=df["MA2"], name="MA2", mode="lines",
+                                 line=dict(color=COLOR_MA2, width=1.3)))
     if "MA3" in df.columns and df["MA3"].notna().any():
-        fig.add_trace(go.Scatter(x=df["time"], y=df["MA3"], name="MA3", mode="lines", line=dict(color=COLOR_MA3, width=1.3)))
+        fig.add_trace(go.Scatter(x=df["time"], y=df["MA3"], name="MA3", mode="lines",
+                                 line=dict(color=COLOR_MA3, width=1.3)))
 
-    fig.update_layout(title=title, height=height, margin=dict(l=10,r=10,t=40,b=10),
-                      xaxis_rangeslider_visible=False,
-                      xaxis=dict(showgrid=False), yaxis=dict(showgrid=True))
+    fig.update_layout(
+        title=title, height=height, margin=dict(l=10, r=10, t=40, b=10),
+        xaxis_rangeslider_visible=False,
+        xaxis=dict(showgrid=False, range=x_range),
+        yaxis=dict(showgrid=True)
+    )
     return fig
 
 with tab5:
@@ -1094,7 +1134,7 @@ with tab5:
     if not ohlc_map:
         st.info("3分足OHLCファイルをアップロードしてください。")
     else:
-        # まずは日付を選ぶ（全ファイルの範囲から）
+        # まず全ファイルから利用可能な日付範囲を推定
         dmin, dmax = ohlc_global_date_range(ohlc_map)
         if dmin is None or dmax is None:
             st.info("有効な日時列が見つかりませんでした。")
@@ -1107,81 +1147,108 @@ with tab5:
             with c3:
                 ht = LARGE_CHART_HEIGHT if enlarge else MAIN_CHART_HEIGHT
 
+            # 表示時間レンジ（固定 9:00〜15:30）
             t0 = pd.Timestamp(f"{sel_date} 09:00", tz=TZ)
             t1 = pd.Timestamp(f"{sel_date} 15:30", tz=TZ)
+            x_range = [t0, t1]
 
             # 選択日のデータがある銘柄（ファイルキー）だけを提示
             keys_that_day = []
             for k, df in ohlc_map.items():
-                if df is None or df.empty: continue
+                if df is None or df.empty: 
+                    continue
                 vw = df[(df["time"]>=t0) & (df["time"]<=t1)]
-                if not vw.empty: keys_that_day.append(k)
+                if not vw.empty:
+                    keys_that_day.append(k)
 
             if not keys_that_day:
                 st.info("選択日のデータがある銘柄が見つかりません。別の日付を選んでください。")
             else:
+                # ラベルに銘柄名を表示
                 options = sorted(keys_that_day)
                 def _fmt_label(k):
                     nm = guess_name_for_ohlc_key(k, CODE_TO_NAME)
                     return f"{k}（{nm}）" if nm else k
-                
+
                 sel_key = st.selectbox("銘柄（ファイル名）を選択", options=options, index=0, format_func=_fmt_label)
-                
                 sel_name = guess_name_for_ohlc_key(sel_key, CODE_TO_NAME)
                 if sel_name:
                     st.caption(f"想定銘柄名: **{sel_name}**")
+
                 view = ohlc_map[sel_key]
                 view = view[(view["time"]>=t0) & (view["time"]<=t1)].copy()
+                if view.empty:
+                    st.info(f"{sel_key}：{sel_date} の3分足が見つかりません。")
+                else:
+                    # 該当コードの約定を当日抽出
+                    yak = yakujyou_all.copy()
+                    if "code_key" in yak.columns:
+                        this_code = extract_code_from_ohlc_key(sel_key) or ""
+                        if this_code:
+                            yak = yak[yak["code_key"].astype(str).str.upper()==this_code.upper()]
+                    y_dtcol = pick_dt_col(yak) or "約定日"
+                    yak = yak.copy()
+                    yak["約定日時"] = pick_dt_with_optional_time(yak) if y_dtcol in yak.columns else _to_jst_series(pd.Series(pd.NaT, index=yak.index), yak.index)
+                    yak = yak[yak["約定日時"].notna()]
+                    yak = yak[(yak["約定日時"]>=t0) & (yak["約定日時"]<=t1)]
 
-                # 約定履歴から該当コードのIN/OUT抽出（当日のみ）
-                yak = yakujyou_all.copy()
-                if "code_key" in yak.columns:
-                    this_code = extract_code_from_ohlc_key(sel_key) or ""
-                    if this_code:
-                        yak = yak[yak["code_key"].astype(str).str.upper()==this_code.upper()]
-                y_dtcol = pick_dt_col(yak) or "約定日"
-                yak = yak.copy()
-                yak["約定日時"] = pick_dt_with_optional_time(yak) if y_dtcol in yak.columns else _to_jst_series(pd.Series(pd.NaT, index=yak.index), yak.index)
-                yak = yak[yak["約定日時"].notna()]
-                yak = yak[(yak["約定日時"]>=t0) & (yak["約定日時"]<=t1)]
+                    # 近傍バーへスナップ（買建/売建/売埋/買埋）
+                    trades = align_trades_to_ohlc(view, yak, max_gap_min=6) if not yak.empty else pd.DataFrame(columns=["time","price","side","qty","label4"])
 
-                trades = align_trades_to_ohlc(view, yak, max_gap_min=6) if not yak.empty else pd.DataFrame(columns=["time","price","side","qty","kind"])
+                    # メインチャート（サイズ統一・時間固定）
+                    title_text = f"{sel_name} [{sel_key}]" if sel_name else sel_key
+                    fig = make_candle_with_indicators(view, title=title_text, height=ht, x_range=x_range)
 
-                title_text = f"{sel_name} [{sel_key}]" if sel_name else sel_key
-                fig = make_candle_with_indicators(view, title=title_text, height=ht)
+                    # 4分類マーカー
+                    marker_styles = {
+                        "買建": dict(symbol="triangle-up",        size=11, color="#2ca02c", line=dict(width=1.2)),
+                        "売建": dict(symbol="triangle-down",      size=11, color="#d62728", line=dict(width=1.2)),
+                        "売埋": dict(symbol="triangle-down-open", size=12, color="#9467bd", line=dict(width=1.4)),
+                        "買埋": dict(symbol="triangle-up-open",   size=12, color="#1f77b4", line=dict(width=1.4)),
+                    }
+                    if not trades.empty:
+                        for label, mk in marker_styles.items():
+                            sub = trades[trades["label4"] == label]
+                            if not sub.empty:
+                                fig.add_trace(go.Scatter(
+                                    x=sub["time"], y=sub["price"], mode="markers",
+                                    name=label, marker=mk,
+                                    hovertemplate=f"{label}<br>%{{x|%H:%M}}<br>¥%{{y:.0f}}<extra></extra>"
+                                ))
 
-                # IN/OUTマーカー
-                if not trades.empty:
-                    ins  = trades[trades["kind"]=="IN"]
-                    outs = trades[trades["kind"]=="OUT"]
-                    if not ins.empty:
-                        fig.add_trace(go.Scatter(x=ins["time"], y=ins["price"], mode="markers",
-                                                 name="IN", marker=dict(symbol="triangle-up", size=10, line=dict(width=1), color="#2ca02c")))
-                    if not outs.empty:
-                        fig.add_trace(go.Scatter(x=outs["time"], y=outs["price"], mode="markers",
-                                                 name="OUT", marker=dict(symbol="triangle-down", size=10, line=dict(width=1), color="#d62728")))
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
 
-                # 同日の下に：日経先物 / 日経平均（任意で表示）
+                # 同日の下に：日経先物 / 日経平均（時間レンジ固定・サイズ統一）
+                # 候補キー（当日データありに限定）
                 fut_keys = [k for k in keys_that_day if ("NK2251" in k or "OSE_NK2251" in k)]
                 idx_keys = [k for k in keys_that_day if ("NI225" in k or "TVC_NI225" in k)]
 
-                def plot_extra(key, title):
-                    df = ohlc_map.get(key)
-                    if df is None or df.empty: 
-                        st.info(f"{title} のデータが見つかりません。"); return
-                    vw = df[(df["time"]>=t0) & (df["time"]<=t1)].copy()
-                    if vw.empty:
-                        st.info(f"{title}：{sel_date} のデータなし。"); return
-                    nm = guess_name_for_ohlc_key(key, CODE_TO_NAME)
-                    ttl = f"{nm} [{key}]" if nm else key
-                    figx = make_candle_with_indicators(vw, title=ttl, height=int(ht*0.8))
-                    st.plotly_chart(figx, use_container_width=True, config={"displayModeBar": True})
-
                 st.markdown("#### 日経先物（NK225mini等）")
-                if fut_keys: plot_extra(fut_keys[0], fut_keys[0])
-                else: st.info("日経先物（`OSE_NK2251!` など）が見つかりません。")
+                if fut_keys:
+                    k = fut_keys[0]
+                    df = ohlc_map.get(k)
+                    vw = df[(df["time"]>=t0) & (df["time"]<=t1)].copy()
+                    if not vw.empty:
+                        nm = guess_name_for_ohlc_key(k, CODE_TO_NAME)
+                        ttl = f"{nm} [{k}]" if nm else k
+                        figx = make_candle_with_indicators(vw, title=ttl, height=ht, x_range=x_range)
+                        st.plotly_chart(figx, use_container_width=True, config={"displayModeBar": True})
+                    else:
+                        st.info(f"{k}：{sel_date} のデータなし。")
+                else:
+                    st.info("日経先物（`OSE_NK2251!` など）が見つかりません。")
 
                 st.markdown("#### 日経平均")
-                if idx_keys: plot_extra(idx_keys[0], idx_keys[0])
-                else: st.info("日経平均（`TVC_NI225` など）が見つかりません。")
+                if idx_keys:
+                    k = idx_keys[0]
+                    df = ohlc_map.get(k)
+                    vw = df[(df["time"]>=t0) & (df["time"]<=t1)].copy()
+                    if not vw.empty:
+                        nm = guess_name_for_ohlc_key(k, CODE_TO_NAME)
+                        ttl = f"{nm} [{k}]" if nm else k
+                        figx = make_candle_with_indicators(vw, title=ttl, height=ht, x_range=x_range)
+                        st.plotly_chart(figx, use_container_width=True, config={"displayModeBar": True})
+                    else:
+                        st.info(f"{k}：{sel_date} のデータなし。")
+                else:
+                    st.info("日経平均（`TVC_NI225` など）が見つかりません。")
