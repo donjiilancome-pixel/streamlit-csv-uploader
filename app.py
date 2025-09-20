@@ -1199,12 +1199,23 @@ with tab5:
                         "数量": to_numeric_jp(yak_day_all[qty_col]) if qty_col else np.nan,
                     }).sort_values("時刻")
 
-                    # 表示整形（カンマ区切り）
-                    disp["価格"] = disp["価格"].round(0).astype("Int64").map(lambda x: f"{x:,}" if pd.notna(x) else "")
-                    disp["数量"] = disp["数量"].astype("Int64").map(lambda x: f"{x:,}" if pd.notna(x) else "")
+                    # ✅ dtype を「数値のまま」保つ（= ユーザー側で数値ソート可）
+                    disp["価格"] = pd.to_numeric(disp["価格"], errors="coerce").round(0)
+                    disp["数量"] = pd.to_numeric(disp["数量"], errors="coerce")
+                    
+                    # 表示は column_config でカンマ区切りに（dtype は数値のまま）
+                    st.dataframe(
+                        disp,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "価格": st.column_config.NumberColumn("価格", format="%,.0f"),
+                            "数量": st.column_config.NumberColumn("数量", format="%,d"),
+                        }
+                    )
 
-                    st.dataframe(disp, use_container_width=True, hide_index=True)
-                    download_button_df(disp, f"⬇ CSVダウンロード（約定表 {sel_date}）", f"fills_{sel_date}.csv")
+# ダウンロードは「数値のまま」出力（並び替え/再計算で便利）
+download_button_df(disp, f"⬇ CSVダウンロード（約定表 {sel_date}）", f"fills_{sel_date}.csv")
 
             # 選択日のデータがある銘柄（ファイルキー）だけを提示
             keys_that_day = []
