@@ -824,6 +824,8 @@ with tab1b:
                         勝率=("win","mean"),
                         平均損益=("PL","mean")
                     )
+                    # 修正: 平均損益を四捨五入
+                    if "平均損益" in by.columns: by["平均損益"] = by["平均損益"].round(0)
                     by = base.merge(by, on="hour_x", how="left")
 
                     # 表示整形用のDataFrameを作成
@@ -878,6 +880,9 @@ with tab1b:
                         収支=("PL","sum"), 取引回数=("PL","count"),
                         勝率=("win","mean"), 平均損益=("PL","mean")
                     ).reset_index()
+                    # 修正: 平均損益を四捨五入
+                    if "平均損益" in cmp.columns: cmp["平均損益"] = cmp["平均損益"].round(0)
+                    
                     cmp_disp = cmp.copy()
                     # 勝率は%表記にするために100倍する
                     cmp_disp["勝率"] = cmp_disp["勝率"] * 100
@@ -970,6 +975,9 @@ def per_symbol_stats(df: pd.DataFrame) -> pd.DataFrame:
     d["group_key"] = np.where(d["code_key"].notna()&(d["code_key"]!=""), d["code_key"], "NAMEONLY::"+d["name_key"].astype(str))
     agg = d.groupby("group_key").agg({"実現損益":["sum","count","mean"], "win":["mean"]})
     agg.columns = ["実現損益合計","取引回数","1回平均損益","勝率"]
+    # 修正: 1回平均損益を四捨五入
+    if "1回平均損益" in agg.columns: agg["1回平均損益"] = agg["1回平均損益"].round(0)
+    
     rep_name = d.groupby("group_key").apply(representative_name).rename("銘柄名")
     code_col = d.groupby("group_key")["code_key"].first().rename("銘柄コード")
     out = agg.join(rep_name).join(code_col).reset_index(drop=True).sort_values("実現損益合計", ascending=False)
@@ -1018,6 +1026,9 @@ with tab4:
             d["group_key"] = np.where(d["code_key"].notna()&(d["code_key"]!=""), d["code_key"], "NAMEONLY::"+d["name_key"].astype(str))
             by_symbol = d.groupby("group_key").agg({"実現損益":["count","sum","mean"]})
             by_symbol.columns = ["取引回数","実現損益合計","1回平均損益"]
+            # 修正: 1回平均損益を四捨五入
+            if "1回平均損益" in by_symbol.columns: by_symbol["1回平均損益"] = by_symbol["1回平均損益"].round(0)
+
             rep_name = d.groupby("group_key").apply(representative_name).rename("銘柄名")
             code_col = d.groupby("group_key")["code_key"].first().rename("銘柄コード")
             out = by_symbol.join(rep_name).join(code_col).reset_index(drop=True)
