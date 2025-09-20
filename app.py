@@ -524,6 +524,23 @@ def extract_code_from_ohlc_key(key: str):
     if m2: return m2.group(1)
     return None
 
+def guess_name_for_ohlc_key(key: str, code_to_name: dict) -> str | None:
+    """
+    3分足ファイル名から code を推定し、実現損益/約定履歴から作った CODE_TO_NAME で銘柄名を返す。
+    見つからない場合は指数・先物などをヒューリスティックに命名。
+    """
+    code = extract_code_from_ohlc_key(key)
+    name = None
+    if code:
+        name = code_to_name.get(code.upper())
+    if not name:
+        ku = key.upper()
+        if "NK2251" in ku or "OSE_NK2251" in ku:
+            name = "日経225先物"
+        elif "NI225" in ku or "TVC_NI225" in ku:
+            name = "日経平均"
+    return name
+
 def build_ohlc_code_index(ohlc_map: dict):
     idx = {}
     for k in ohlc_map.keys():
@@ -1103,7 +1120,16 @@ with tab5:
             if not keys_that_day:
                 st.info("選択日のデータがある銘柄が見つかりません。別の日付を選んでください。")
             else:
-                sel_key = st.selectbox("銘柄（ファイル名）を選択", sorted(keys_that_day), index=0)
+                options = sorted(keys_that_day)
+                def _fmt_label(k):
+                    nm = guess_name_for_ohlc_key(k, CODE_TO_NAME)
+                    return f"{k}（{nm}）" if nm else k
+                
+                sel_key = st.selectbox("銘柄（ファイル名）を選択", options=options, index=0, format_func=_fmt_label)
+                
+                sel_name = guess_name_for_ohlc_key(sel_key, CODE_TO_NAME)
+                if sel_name:
+                    st.caption(f"想定銘柄名: **{sel_name}**")
                 view = ohlc_map[sel_key]
                 view = view[(view["time"]>=t0) & (view["time"]<=t1)].copy()
 
@@ -1121,7 +1147,8 @@ with tab5:
 
                 trades = align_trades_to_ohlc(view, yak, max_gap_min=6) if not yak.empty else pd.DataFrame(columns=["time","price","side","qty","kind"])
 
-                fig = make_candle_with_indicators(view, title=f"{sel_key}", height=ht)
+                title_text = f"{sel_name} [{sel_key}]" if sel_name else sel_key
+                fig = make_candle_with_indicators(view, title=title_text, height=ht)
 
                 # IN/OUTマーカー
                 if not trades.empty:
@@ -1146,7 +1173,9 @@ with tab5:
                     vw = df[(df["time"]>=t0) & (df["time"]<=t1)].copy()
                     if vw.empty:
                         st.info(f"{title}：{sel_date} のデータなし。"); return
-                    figx = make_candle_with_indicators(vw, title=title, height=int(ht*0.8))
+                    nm = guess_name_for_ohlc_key(key, CODE_TO_NAME)
+                    ttl = f"{nm} [{key}]" if nm else key
+                    figx = make_candle_with_indicators(vw, title=ttl, height=int(ht*0.8))
                     st.plotly_chart(figx, use_container_width=True, config={"displayModeBar": True})
 
                 st.markdown("#### 日経先物（NK225mini等）")
