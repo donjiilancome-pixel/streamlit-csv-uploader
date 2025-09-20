@@ -533,12 +533,12 @@ with tab4:
         if "code_key" not in r.columns:
             st.info("銘柄コード列が見つかりません。")
         else:
-            agg = r.groupby("code_key").agg(
-                実現損益合計=("実現損益[円]", "sum"),
-                取引回数=("実現損益[円]", "count"),
-                1回平均損益=("実現損益[円]", lambda s: s.mean() if len(s)>0 else np.nan),
-                銘柄名=("name_key", lambda s: s.dropna().iloc[0] if s.dropna().size>0 else "")
-            ).reset_index().rename(columns={"code_key":"銘柄コード"})
+            agg = r.groupby("code_key").agg(**{
+                "実現損益合計": ("実現損益[円]", "sum"),
+                "取引回数": ("実現損益[円]", "count"),
+                "1回平均損益": ("実現損益[円]", "mean"),
+                "銘柄名": ("name_key", lambda s: s.dropna().iloc[0] if s.dropna().size>0 else ""),
+            }).reset_index().rename(columns={"code_key":"銘柄コード"})
 
             st.dataframe(
                 agg[["銘柄コード","銘柄名","実現損益合計","取引回数","1回平均損益"]],
