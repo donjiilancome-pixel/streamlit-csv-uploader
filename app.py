@@ -1040,6 +1040,26 @@ except NameError:
                 name = "日経平均"
         return name
 
+# --- Indexの最近傍位置（DatetimeIndex × Timestamp[JST]）を安全に求める ---
+def _nearest_pos_by_ns(idx: pd.DatetimeIndex, t0: pd.Timestamp) -> int:
+    """
+    idx: tz-awareな DatetimeIndex を想定。t0 も tz-aware（JST）を想定。
+    nsの差の絶対値で argmin を取り、バージョン差異を回避。
+    """
+    # 念のため tz-aware に強制（tz-naiveならJST付与）
+    if not isinstance(idx, pd.DatetimeIndex):
+        idx = pd.DatetimeIndex(idx)
+    if idx.tz is None:
+        idx = idx.tz_localize(TZ)
+    if t0.tzinfo is None:
+        t0 = t0.tz_localize(TZ)
+
+    # int64(ns)に変換して距離を計算
+    idx_ns = idx.view("int64")
+    t0_ns  = int(pd.Timestamp(t0).value)
+    dist = np.abs(idx_ns - t0_ns)
+    return int(dist.argmin())
+
 # --- IN/OUTを4分類（買建/売建/売埋/買埋）で近傍バーへスナップ ---
 def align_trades_to_ohlc(ohlc: pd.DataFrame, trades: pd.DataFrame, max_gap_min=6):
     """約定（買建/売建/売埋/買埋）をOHLCの最も近いバーに結びつける。"""
@@ -1078,22 +1098,24 @@ def align_trades_to_ohlc(ohlc: pd.DataFrame, trades: pd.DataFrame, max_gap_min=6
 
     tdf["label4"] = tdf["side"].map(classify_side4)
 
+    # OHLCのindexをJSTのDatetimeIndexにしてソート
     odf = ohlc.copy()
     tt = _to_jst_series(odf["time"], odf.index)
-    odf = odf.set_index(tt)
+    odf = odf.set_index(tt).sort_index()
 
     out_rows = []
     for _, row in tdf.iterrows():
         t0 = row["約定日時"]
-        if pd.isna(t0) or not row.get("label4"):
+        if pd.isna(t0) or not row.get("label4"):  # ラベル未判定はスキップ
             continue
         lo = t0 - pd.Timedelta(minutes=max_gap_min)
         hi = t0 + pd.Timedelta(minutes=max_gap_min)
         window = odf.loc[lo:hi]
         if window.empty:
             continue
-        idx = (window.index - t0).abs().argmin()
-        near_time = window.index[idx]
+        # ここを ns 差の argmin に変更（.abs().argmin() を使わない）
+        pos = _nearest_pos_by_ns(window.index, t0)
+        near_time = window.index[pos]
         price_on_bar = window.loc[near_time, "close"]
         out_rows.append({
             "time": near_time, "price": price_on_bar,
@@ -1155,7 +1177,7 @@ with tab5:
             # 選択日のデータがある銘柄（ファイルキー）だけを提示
             keys_that_day = []
             for k, df in ohlc_map.items():
-                if df is None or df.empty: 
+                if df is None or df.empty:
                     continue
                 vw = df[(df["time"]>=t0) & (df["time"]<=t1)]
                 if not vw.empty:
@@ -1192,7 +1214,7 @@ with tab5:
                     yak = yak[yak["約定日時"].notna()]
                     yak = yak[(yak["約定日時"]>=t0) & (yak["約定日時"]<=t1)]
 
-                    # 近傍バーへスナップ（買建/売建/売埋/買埋）
+                    # 近傍バーへスナップ（買建/売建/売埋/買埋）— ns差で安全に検索
                     trades = align_trades_to_ohlc(view, yak, max_gap_min=6) if not yak.empty else pd.DataFrame(columns=["time","price","side","qty","label4"])
 
                     # メインチャート（サイズ統一・時間固定）
